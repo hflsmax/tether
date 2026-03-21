@@ -1,0 +1,12 @@
+[package]
+name = "tether-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+bitflags = { version = "2", features = ["serde"] }

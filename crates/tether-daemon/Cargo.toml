@@ -1,0 +1,15 @@
+[package]
+name = "tether-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tether-protocol = { workspace = true }
+tether-session = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time", "signal", "macros"] }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+nix = { version = "0.29", features = ["user"] }

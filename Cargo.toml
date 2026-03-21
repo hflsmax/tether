@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tether-protocol",
+    "crates/tether-session",
+    "crates/tether-daemon",
+    "crates/tetherd",
+    "crates/tether-proxy",
+    "crates/tether",
+]
+
+[workspace.metadata.crane]
+name = "tether"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tether-protocol = { path = "crates/tether-protocol" }
+tether-session = { path = "crates/tether-session" }
+tether-daemon = { path = "crates/tether-daemon" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+anyhow = "1"
