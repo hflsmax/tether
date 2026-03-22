@@ -28,14 +28,19 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
+      - name: Rename binaries
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../tether-${{ matrix.target }}.tar.gz tether tetherd tether-proxy
+          for bin in tether tetherd tether-proxy; do
+            cp $bin ../../../${bin}-${{ matrix.target }}
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: tether-${{ matrix.target }}
-          path: tether-${{ matrix.target }}.tar.gz
+          path: |
+            tether-${{ matrix.target }}
+            tetherd-${{ matrix.target }}
+            tether-proxy-${{ matrix.target }}
 
   build-macos:
     runs-on: ubuntu-latest
@@ -54,14 +59,12 @@ jobs:
         run: cargo install cargo-zigbuild
       - name: Build client
         run: cargo zigbuild -p tether --release --target ${{ matrix.target }}
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../tether-${{ matrix.target }}.tar.gz tether
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/tether tether-${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: tether-${{ matrix.target }}
-          path: tether-${{ matrix.target }}.tar.gz
+          path: tether-${{ matrix.target }}
 
   release:
     needs: [build-linux, build-macos]
@@ -78,4 +81,4 @@ jobs:
           gh release create ${{ github.ref_name }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            artifacts/tether-*/*.tar.gz
+            artifacts/tether-*/*
