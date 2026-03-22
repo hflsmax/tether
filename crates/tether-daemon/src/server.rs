@@ -77,6 +77,10 @@ async fn handle_connection(
     let mut codec = FrameCodec::new();
     let write_codec = FrameCodec::new();
 
+    // Timeout for writes — if the proxy/SSH is dead but the Unix socket hasn't
+    // closed, writes will block until the socket buffer fills. Detect it early.
+    let write_timeout = Duration::from_secs(5);
+
     // Wait for Hello
     let msg = codec.read_message(&mut reader).await?;
     match msg {
@@ -120,232 +124,224 @@ async fn handle_connection(
     }
     let mut attached: Option<AttachState> = None;
 
-    loop {
-        tokio::select! {
-            // Read message from client
-            result = codec.read_message(&mut reader) => {
-                let msg = match result {
-                    Ok(msg) => msg,
-                    Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
-                        if let Some(ref state) = attached {
-                            info!(session = %state.id, "client disconnected");
+    // Write with timeout — prevents blocking forever on dead connections.
+    macro_rules! timed_write {
+        ($msg:expr) => {
+            match tokio::time::timeout(write_timeout, write_codec.write_message(&mut writer, $msg)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => anyhow::bail!("write timeout"),
+            }
+        };
+    }
+
+    // Run the main loop inside an async block so that `?` and `return` exit
+    // the block — not the function — letting us always detach below.
+    let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+                // Read message from client
+                result = codec.read_message(&mut reader) => {
+                    let msg = match result {
+                        Ok(msg) => msg,
+                        Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+
+                    match msg {
+                        Message::SessionCreate { id, cmd, cols, rows, env } => {
+                            let env_vec: Vec<(String, String)> = env.into_iter().collect();
                             let mut reg = registry.lock().await;
-                            reg.detach(&state.id);
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-
-                match msg {
-                    Message::SessionCreate { id, cmd, cols, rows, env } => {
-                        let env_vec: Vec<(String, String)> = env.into_iter().collect();
-                        let mut reg = registry.lock().await;
-                        match reg.create_session(id, cmd, cols, rows, env_vec) {
-                            Ok(id) => {
-                                write_codec
-                                    .write_message(&mut writer, &Message::SessionCreated { id })
-                                    .await?;
-                            }
-                            Err(e) => {
-                                write_codec
-                                    .write_message(
-                                        &mut writer,
-                                        &Message::Error { code: 10, message: e },
-                                    )
-                                    .await?;
-                            }
-                        }
-                    }
-
-                    Message::SessionAttach { id } => {
-                        // Detach from current session if any
-                        if let Some(ref prev) = attached {
-                            let mut reg = registry.lock().await;
-                            reg.detach(&prev.id);
-                        }
-                        attached = None;
-
-                        let mut reg = registry.lock().await;
-                        match reg.attach(&id) {
-                            Ok((rx, event_rx_opt)) => {
-                                let handle = match reg.take_handle(&id) {
-                                    Some(h) => h,
-                                    None => {
-                                        drop(reg);
-                                        write_codec
-                                            .write_message(
-                                                &mut writer,
-                                                &Message::Error { code: 11, message: "session handle missing".into() },
-                                            )
-                                            .await?;
-                                        continue;
-                                    }
-                                };
-
-                                let first_attach = event_rx_opt.is_some();
-
-                                if first_attach {
-                                    // First attach: skip snapshot — shell just started
-                                    // and raw output with proper colors will follow.
-                                    drop(reg);
-                                    write_codec
-                                        .write_message(&mut writer, &Message::HelloOk { version: PROTOCOL_VERSION })
-                                        .await?;
-                                } else {
-                                    // Reattach: send snapshot to restore screen state.
-                                    let snapshot = handle.snapshot(config.scrollback_lines).await;
-                                    drop(reg);
-                                    write_codec
-                                        .write_message(&mut writer, &Message::SessionState(snapshot))
-                                        .await?;
+                            match reg.create_session(id, cmd, cols, rows, env_vec) {
+                                Ok(id) => {
+                                    timed_write!(&Message::SessionCreated { id });
                                 }
+                                Err(e) => {
+                                    timed_write!(
+                                        &Message::Error { code: 10, message: e }
+                                    );
+                                }
+                            }
+                        }
 
-                                let reattach = !first_attach;
-                                info!(session = %id, reattach, "client attached");
+                        Message::SessionAttach { id } => {
+                            // Detach from current session if any
+                            if let Some(ref prev) = attached {
+                                let mut reg = registry.lock().await;
+                                reg.detach(&prev.id);
+                            }
+                            attached = None;
 
-                                attached = Some(AttachState {
-                                    id: id.clone(),
-                                    handle: handle.clone(),
-                                    output_rx: rx,
-                                });
+                            let mut reg = registry.lock().await;
+                            match reg.attach(&id) {
+                                Ok((rx, event_rx_opt)) => {
+                                    let handle = match reg.take_handle(&id) {
+                                        Some(h) => h,
+                                        None => {
+                                            drop(reg);
+                                            timed_write!(
+                                                &Message::Error { code: 11, message: "session handle missing".into() }
+                                            );
+                                            continue;
+                                        }
+                                    };
 
-                                if let Some(mut erx) = event_rx_opt {
-                                    let reg_clone = registry.clone();
-                                    let session_id = id.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(event) = erx.recv().await {
-                                            match event {
-                                                SessionEvent::Output(data) => {
-                                                    // Get sender without holding lock across send
-                                                    let tx = {
-                                                        let reg = reg_clone.lock().await;
-                                                        reg.get_output_tx(&session_id).cloned()
-                                                    };
-                                                    if let Some(tx) = tx {
-                                                        // Lock is already released, so this
-                                                        // send can't deadlock even if it blocks.
-                                                        let _ = tx.send(data).await;
+                                    let first_attach = event_rx_opt.is_some();
+
+                                    if first_attach {
+                                        // First attach: skip snapshot — shell just started
+                                        // and raw output with proper colors will follow.
+                                        drop(reg);
+                                        timed_write!(&Message::HelloOk { version: PROTOCOL_VERSION });
+                                    } else {
+                                        // Reattach: send snapshot to restore screen state.
+                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
+                                        drop(reg);
+                                        timed_write!(&Message::SessionState(snapshot));
+                                    }
+
+                                    let reattach = !first_attach;
+                                    info!(session = %id, reattach, "client attached");
+
+                                    attached = Some(AttachState {
+                                        id: id.clone(),
+                                        handle: handle.clone(),
+                                        output_rx: rx,
+                                    });
+
+                                    if let Some(mut erx) = event_rx_opt {
+                                        let reg_clone = registry.clone();
+                                        let session_id = id.clone();
+                                        tokio::spawn(async move {
+                                            while let Some(event) = erx.recv().await {
+                                                match event {
+                                                    SessionEvent::Output(data) => {
+                                                        // Get sender without holding lock across send
+                                                        let tx = {
+                                                            let reg = reg_clone.lock().await;
+                                                            reg.get_output_tx(&session_id).cloned()
+                                                        };
+                                                        if let Some(tx) = tx {
+                                                            // Lock is already released, so this
+                                                            // send can't deadlock even if it blocks.
+                                                            let _ = tx.send(data).await;
+                                                        }
+                                                    }
+                                                    SessionEvent::Exited(code) => {
+                                                        info!(session = %session_id, exit_code = code, "session process exited");
+                                                        let mut reg = reg_clone.lock().await;
+                                                        reg.mark_exited(&session_id);
+                                                        break;
                                                     }
                                                 }
-                                                SessionEvent::Exited(code) => {
-                                                    info!(session = %session_id, exit_code = code, "session process exited");
-                                                    let mut reg = reg_clone.lock().await;
-                                                    reg.mark_exited(&session_id);
-                                                    break;
-                                                }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    drop(reg);
+                                    timed_write!(
+                                        &Message::Error { code: 11, message: e }
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                drop(reg);
-                                write_codec
-                                    .write_message(
-                                        &mut writer,
-                                        &Message::Error { code: 11, message: e },
-                                    )
-                                    .await?;
-                            }
                         }
-                    }
 
-                    Message::SessionDetach => {
-                        if let Some(ref state) = attached {
+                        Message::SessionDetach => {
+                            if let Some(ref state) = attached {
+                                let mut reg = registry.lock().await;
+                                reg.detach(&state.id);
+                            }
+                            attached = None;
+                        }
+
+                        Message::SessionDestroy { id } => {
                             let mut reg = registry.lock().await;
-                            reg.detach(&state.id);
-                        }
-                        attached = None;
-                    }
-
-                    Message::SessionDestroy { id } => {
-                        let mut reg = registry.lock().await;
-                        match reg.destroy(&id) {
-                            Ok(()) => {
-                                if attached.as_ref().is_some_and(|s| s.id == id) {
-                                    attached = None;
+                            match reg.destroy(&id) {
+                                Ok(()) => {
+                                    if attached.as_ref().is_some_and(|s| s.id == id) {
+                                        attached = None;
+                                    }
+                                    timed_write!(&Message::SessionCreated { id });
                                 }
-                                write_codec
-                                    .write_message(&mut writer, &Message::SessionCreated { id })
-                                    .await?;
-                            }
-                            Err(e) => {
-                                write_codec
-                                    .write_message(
-                                        &mut writer,
-                                        &Message::Error { code: 12, message: e },
-                                    )
-                                    .await?;
+                                Err(e) => {
+                                    timed_write!(
+                                        &Message::Error { code: 12, message: e }
+                                    );
+                                }
                             }
                         }
-                    }
 
-                    Message::SessionList => {
-                        let reg = registry.lock().await;
-                        let sessions = reg.list();
-                        drop(reg);
-                        write_codec
-                            .write_message(&mut writer, &Message::SessionListResp { sessions })
-                            .await?;
-                    }
+                        Message::SessionList => {
+                            let reg = registry.lock().await;
+                            let sessions = reg.list();
+                            drop(reg);
+                            timed_write!(&Message::SessionListResp { sessions });
+                        }
 
-                    // Hot path: no registry lock needed — we have the handle directly
-                    Message::Data(data) => {
-                        if let Some(ref state) = attached
-                            && let Err(e) = state.handle.write_input(&data)
-                        {
-                            warn!(session = %state.id, "failed to write to pty: {e}");
+                        // Hot path: no registry lock needed — we have the handle directly
+                        Message::Data(data) => {
+                            if let Some(ref state) = attached
+                                && let Err(e) = state.handle.write_input(&data)
+                            {
+                                warn!(session = %state.id, "failed to write to pty: {e}");
+                            }
+                        }
+
+                        Message::Resize { cols, rows } => {
+                            if let Some(ref state) = attached
+                                && let Err(e) = state.handle.resize(cols, rows).await
+                            {
+                                warn!(session = %state.id, "failed to resize pty: {e}");
+                            }
+                        }
+
+                        Message::Ping { seq } => {
+                            timed_write!(&Message::Pong { seq });
+                        }
+
+                        _ => {
+                            debug!("unexpected message type: 0x{:02x}", msg.type_id());
                         }
                     }
+                }
 
-                    Message::Resize { cols, rows } => {
-                        if let Some(ref state) = attached
-                            && let Err(e) = state.handle.resize(cols, rows).await
-                        {
-                            warn!(session = %state.id, "failed to resize pty: {e}");
+                // Forward PTY output to client — no lock needed
+                result = async {
+                    if let Some(ref mut state) = attached {
+                        state.output_rx.recv().await
+                    } else {
+                        std::future::pending::<Option<Vec<u8>>>().await
+                    }
+                } => {
+                    match result {
+                        Some(data) => {
+                            timed_write!(&Message::Data(data));
                         }
-                    }
-
-                    Message::Ping { seq } => {
-                        write_codec
-                            .write_message(&mut writer, &Message::Pong { seq })
-                            .await?;
-                    }
-
-                    _ => {
-                        debug!("unexpected message type: 0x{:02x}", msg.type_id());
-                    }
-                }
-            }
-
-            // Forward PTY output to client — no lock needed
-            result = async {
-                if let Some(ref mut state) = attached {
-                    state.output_rx.recv().await
-                } else {
-                    std::future::pending::<Option<Vec<u8>>>().await
-                }
-            } => {
-                match result {
-                    Some(data) => {
-                        write_codec
-                            .write_message(&mut writer, &Message::Data(data))
-                            .await?;
-                    }
-                    None => {
-                        // Channel closed — session exited. Notify client.
-                        if let Some(state) = attached.take() {
-                            write_codec
-                                .write_message(
-                                    &mut writer,
-                                    &Message::SessionExited { id: state.id, exit_code: 0 },
-                                )
-                                .await?;
+                        None => {
+                            // Channel closed — session exited. Notify client.
+                            if let Some(state) = attached.take() {
+                                timed_write!(
+                                    &Message::SessionExited { id: state.id, exit_code: 0 }
+                                );
+                            }
                         }
                     }
                 }
             }
         }
+    }.await;
+
+    // Always detach on exit, regardless of how we got here.
+    // This ensures the session becomes available for reattachment even if
+    // the connection was lost without a clean SessionDetach or ConnectionClosed.
+    if let Some(ref state) = attached {
+        info!(session = %state.id, "client disconnected");
+        let mut reg = registry.lock().await;
+        reg.detach(&state.id);
     }
+
+    result
 }

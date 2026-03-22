@@ -1381,3 +1381,107 @@ async fn test_foreground_process_reported() {
 
     std::fs::remove_file(&socket_path).ok();
 }
+
+/// When the daemon cannot write output to the client (e.g. proxy alive but SSH
+/// tunnel dead after laptop sleep), the write timeout should fire and the
+/// session should be detached — not stuck as "attached" forever.
+#[tokio::test]
+async fn test_write_timeout_detaches_session() {
+    let socket_path = test_socket_path("write-timeout");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "timeout-test").await;
+
+    // Generate lots of output to fill the socket buffer.
+    // With nobody reading, the daemon's timed write will block once the
+    // buffer is full and the 5-second write timeout will fire.
+    wc.write_message(&mut w, &Message::Data(b"seq 1 1000000\n".to_vec()))
+        .await
+        .unwrap();
+
+    // Stop reading — keep w alive so the socket isn't fully closed
+    // (a full close would trigger the read-side ConnectionClosed path,
+    // not the write timeout path we're testing).
+
+    // Wait for: output generation + buffer fill + 5s timeout + margin
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Drop old connection
+    drop(r);
+    drop(w);
+
+    // New connection: verify session is detached (not stuck as "attached")
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionList)
+        .await
+        .unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1, "session should still exist");
+            assert!(
+                !sessions[0].attached,
+                "session should be detached after write timeout"
+            );
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// After a write timeout detaches a session, a new client should be able
+/// to reattach and the session should still be functional.
+#[tokio::test]
+async fn test_reattach_works_after_write_timeout() {
+    let socket_path = test_socket_path("reattach-timeout");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "reattach-test").await;
+
+    // Generate output, stop reading → triggers write timeout
+    wc.write_message(&mut w, &Message::Data(b"seq 1 1000000\n".to_vec()))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    drop(r);
+    drop(w);
+
+    // Reattach with new client
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(
+        &mut w2,
+        &Message::SessionAttach {
+            id: "reattach-test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    assert!(
+        matches!(resp, Message::SessionState(_)),
+        "should get snapshot on reattach"
+    );
+
+    // Session should still be usable
+    send_and_expect(
+        &wc2,
+        &mut rc2,
+        &mut r2,
+        &mut w2,
+        "echo hello-after-timeout\n",
+        "hello-after-timeout",
+    )
+    .await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
