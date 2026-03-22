@@ -268,6 +268,8 @@ async fn connect(
         Ok((Box::new(r), Box::new(w), None))
     } else if let Some(host) = host {
         let mut child = Command::new("ssh")
+            .arg("-o").arg("ServerAliveInterval=5")
+            .arg("-o").arg("ServerAliveCountMax=2")
             .arg(host)
             .arg("tether-proxy")
             .stdin(Stdio::piped())
@@ -417,6 +419,14 @@ async fn run_session(
             if !is_connection_loss {
                 return result;
             }
+
+            // Kill the old SSH process so buffered keystrokes aren't
+            // delivered to the remote when the network recovers.
+            if let Some(ref mut child) = _child {
+                let _ = child.kill().await;
+            }
+            drop(writer);
+            drop(reader);
 
             // Reconnect loop with exponential backoff
             let mut delay = std::time::Duration::from_millis(100);
