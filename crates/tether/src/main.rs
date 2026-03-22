@@ -389,7 +389,6 @@ async fn run_session(
         }
         Message::HelloOk { .. } => {
             let guard = RawModeGuard::enable()?;
-            // Clear so the session starts on a clean screen
             std::io::stdout().write_all(b"\x1b[2J\x1b[H")?;
             std::io::stdout().flush()?;
             guard
@@ -398,12 +397,103 @@ async fn run_session(
         _ => RawModeGuard::enable()?,
     };
 
-    io_loop(
+    // I/O loop with automatic reconnection on connection loss
+    let result = io_loop(
         &write_codec,
         &mut read_codec,
         writer.as_mut(),
         reader.as_mut(),
         &session_id,
+    )
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(ref e) => {
+            // Check if this was a connection loss (not a deliberate detach/exit)
+            let is_connection_loss = format!("{e}").contains("connection closed")
+                || format!("{e}").contains("Broken pipe")
+                || format!("{e}").contains("Connection reset");
+            if !is_connection_loss {
+                return result;
+            }
+
+            // Reconnect loop with exponential backoff
+            let mut delay = std::time::Duration::from_millis(100);
+            let max_delay = std::time::Duration::from_secs(30);
+            loop {
+                {
+                    let mut out = std::io::stdout();
+                    let _ = write!(out, "\r\n[connection lost, reconnecting in {}s...]\r\n",
+                        delay.as_secs().max(1));
+                    let _ = out.flush();
+                }
+                tokio::time::sleep(delay).await;
+
+                match reconnect_session(host, socket, &session_id).await {
+                    Ok(()) => return Ok(()),
+                    Err(_) => {
+                        delay = (delay * 2).min(max_delay);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn reconnect_session(
+    host: &Option<String>,
+    socket: &Option<String>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let (mut reader, mut writer, mut _child) = connect(host, socket).await?;
+    let write_codec = FrameCodec::new();
+    let mut read_codec = FrameCodec::new();
+
+    handshake(
+        &write_codec,
+        &mut read_codec,
+        writer.as_mut(),
+        reader.as_mut(),
+    )
+    .await?;
+
+    write_codec
+        .write_message(
+            writer.as_mut(),
+            &Message::SessionAttach { id: session_id.to_string() },
+        )
+        .await?;
+
+    match read_codec.read_message(reader.as_mut()).await? {
+        Message::SessionState(state) => {
+            let mut stdout = std::io::stdout();
+            execute!(
+                stdout,
+                terminal::Clear(terminal::ClearType::All),
+                cursor::MoveTo(0, 0)
+            )?;
+            render::render_snapshot(&state, &mut stdout)?;
+            stdout.write_all(b"\x1b[0m")?;
+            stdout.flush()?;
+        }
+        Message::HelloOk { .. } => {}
+        Message::Error { message, .. } => anyhow::bail!("reattach failed: {message}"),
+        _ => {}
+    }
+
+    {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\r\n[reconnected]\r\n");
+        let _ = out.flush();
+    }
+
+    io_loop(
+        &write_codec,
+        &mut read_codec,
+        writer.as_mut(),
+        reader.as_mut(),
+        session_id,
     )
     .await
 }
@@ -455,7 +545,7 @@ async fn io_loop(
                         debug!("unexpected message: {:?}", msg.type_id());
                     }
                     Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
-                        return Ok(());
+                        anyhow::bail!("connection closed");
                     }
                     Err(e) => return Err(e.into()),
                 }
