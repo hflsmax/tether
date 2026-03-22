@@ -85,15 +85,16 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
     execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
 
     let kill_session = |id: &str, host: &Option<String>, socket: &Option<String>| -> anyhow::Result<()> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
-            let (mut r, mut w, _) = connect(host, socket).await?;
-            let wc = FrameCodec::new();
-            let mut rc = FrameCodec::new();
-            handshake(&wc, &mut rc, w.as_mut(), r.as_mut()).await?;
-            wc.write_message(w.as_mut(), &Message::SessionDestroy { id: id.into() }).await?;
-            let _ = rc.read_message(r.as_mut()).await;
-            Ok(())
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let (mut r, mut w, _) = connect(host, socket).await?;
+                let wc = FrameCodec::new();
+                let mut rc = FrameCodec::new();
+                handshake(&wc, &mut rc, w.as_mut(), r.as_mut()).await?;
+                wc.write_message(w.as_mut(), &Message::SessionDestroy { id: id.into() }).await?;
+                let _ = rc.read_message(r.as_mut()).await;
+                Ok(())
+            })
         })
     };
 
