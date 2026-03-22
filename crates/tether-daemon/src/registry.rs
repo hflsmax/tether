@@ -16,6 +16,8 @@ struct SessionEntry {
     /// Channel to forward PTY output to the attached client
     output_tx: Option<mpsc::Sender<Vec<u8>>>,
     detached_at: Option<Instant>,
+    created_at: Instant,
+    cmd: String,
 }
 
 pub struct Registry {
@@ -73,6 +75,8 @@ impl Registry {
                 event_rx: Some(event_rx),
                 output_tx: None,
                 detached_at: Some(Instant::now()),
+                created_at: Instant::now(),
+                cmd: cmd.to_string(),
             },
         );
 
@@ -128,16 +132,25 @@ impl Registry {
         self.sessions
             .iter()
             .map(|(id, entry)| {
+                let pid = entry.handle.child_pid();
                 let idle_secs = entry
                     .detached_at
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(0);
+                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let foreground_proc = read_foreground_proc(pid);
                 SessionInfo {
                     id: id.clone(),
                     cols: 0,
                     rows: 0,
                     attached: entry.output_tx.is_some(),
                     idle_secs,
+                    created_secs: entry.created_at.elapsed().as_secs(),
+                    cmd: entry.cmd.clone(),
+                    cwd,
+                    foreground_proc,
                 }
             })
             .collect()
@@ -166,4 +179,33 @@ impl Registry {
         self.sessions.remove(id);
         info!(session = %id, "session removed (exited)");
     }
+}
+
+/// Read the foreground process name for a shell PID.
+/// Walks the child tree to find the leaf process (the one the user is interacting with).
+fn read_foreground_proc(shell_pid: i32) -> String {
+    // Find the deepest child — that's usually the foreground command.
+    // Walk: shell_pid → child → grandchild → ...
+    let mut pid = shell_pid;
+    loop {
+        // Read /proc/<pid>/task/<pid>/children to find child PIDs
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        match std::fs::read_to_string(&children_path) {
+            Ok(content) => {
+                let child: Option<i32> = content
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .next();
+                match child {
+                    Some(c) => pid = c,
+                    None => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // Read the comm (process name) of the leaf process
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }

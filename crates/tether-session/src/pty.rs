@@ -96,6 +96,11 @@ pub fn spawn_pty(
                 unsafe { std::env::set_var(key, val) };
             }
 
+            // Start in the user's home directory
+            if let Ok(home) = std::env::var("HOME") {
+                let _ = std::env::set_current_dir(&home);
+            }
+
             // Exec the command
             let cmd_cstr = CString::new(cmd)?;
             let args = [cmd_cstr.clone()];

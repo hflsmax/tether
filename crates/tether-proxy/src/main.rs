@@ -22,7 +22,17 @@ async fn main() -> anyhow::Result<()> {
     let socket_path = socket_path();
     debug!("connecting to {}", socket_path.display());
 
-    let stream = UnixStream::connect(&socket_path).await?;
+    let stream = UnixStream::connect(&socket_path).await.map_err(|e| {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("daemon not running (socket not found: {})", socket_path.display())
+            }
+            std::io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!("daemon not accepting connections ({})", socket_path.display())
+            }
+            _ => anyhow::anyhow!("failed to connect to daemon at {}: {e}", socket_path.display()),
+        }
+    })?;
     let (mut sock_reader, mut sock_writer) = stream.into_split();
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();

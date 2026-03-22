@@ -114,6 +114,11 @@ pub struct SessionInfo {
     pub rows: u16,
     pub attached: bool,
     pub idle_secs: u64,
+    pub created_secs: u64,
+    pub cmd: String,
+    pub cwd: String,
+    /// Name of the foreground process (e.g. "vim", "cargo")
+    pub foreground_proc: String,
 }
 
 // -- Protocol messages --
@@ -449,6 +454,10 @@ mod tests {
                     rows: 24,
                     attached: true,
                     idle_secs: 0,
+                    created_secs: 120,
+                    cmd: "/bin/zsh".into(),
+                    cwd: "/home/user".into(),
+                    foreground_proc: "vim".into(),
                 },
                 SessionInfo {
                     id: "calm-river".into(),
@@ -456,6 +465,10 @@ mod tests {
                     rows: 40,
                     attached: false,
                     idle_secs: 3600,
+                    created_secs: 7200,
+                    cmd: "/bin/bash".into(),
+                    cwd: "/tmp".into(),
+                    foreground_proc: "cargo".into(),
                 },
             ],
         };

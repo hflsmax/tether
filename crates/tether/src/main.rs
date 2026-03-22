@@ -4,16 +4,15 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use crossterm::{cursor, execute, terminal};
 use tokio::process::Command;
 use tracing::{debug, info};
 
-use tether_protocol::{FrameCodec, Message, PROTOCOL_VERSION};
+use tether_protocol::{FrameCodec, Message, SessionInfo, PROTOCOL_VERSION};
 
 const DETACH_BYTE: u8 = 0x1c; // Ctrl-backslash
 
-/// Guard that restores terminal state on drop (panic, early return, etc.)
 struct RawModeGuard {
     enabled: bool,
 }
@@ -30,52 +29,25 @@ impl Drop for RawModeGuard {
         if self.enabled {
             let _ = terminal::disable_raw_mode();
             let _ = execute!(std::io::stdout(), cursor::Show);
-            // Print a newline so the shell prompt starts on a fresh line
             let _ = std::io::stdout().write_all(b"\r\n");
             let _ = std::io::stdout().flush();
         }
     }
 }
 
+/// Persistent terminal sessions over SSH
+///
+/// Usage: tether <user@host>
+///        tether --socket <path>
 #[derive(Parser)]
-#[command(name = "tether", about = "Tether — persistent terminal sessions")]
+#[command(name = "tether")]
 struct Cli {
     /// Remote host (user@host)
-    #[arg(short = 'H', long, env = "TETHER_HOST")]
     host: Option<String>,
 
     /// Use direct Unix socket connection (no SSH)
     #[arg(long)]
     socket: Option<String>,
-
-    #[command(subcommand)]
-    command: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Create and attach to a new session
-    New {
-        /// Session name (auto-generated if omitted)
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Shell command to run
-        #[arg(short, long)]
-        cmd: Option<String>,
-    },
-    /// Attach to an existing session
-    Attach {
-        /// Session name
-        name: String,
-    },
-    /// List sessions
-    #[command(alias = "ls")]
-    List,
-    /// Destroy a session
-    Destroy {
-        /// Session name
-        name: String,
-    },
 }
 
 #[tokio::main]
@@ -90,22 +62,176 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Cmd::New { name, cmd } => {
-            run_session(&cli.host, &cli.socket, name, cmd, false).await?;
-        }
-        Cmd::Attach { name } => {
-            run_session(&cli.host, &cli.socket, Some(name), None, true).await?;
-        }
-        Cmd::List => {
-            list_sessions(&cli.host, &cli.socket).await?;
-        }
-        Cmd::Destroy { name } => {
-            destroy_session(&cli.host, &cli.socket, &name).await?;
-        }
+    if cli.host.is_none() && cli.socket.is_none() {
+        anyhow::bail!("usage: tether <user@host>\n       tether --socket <path>");
     }
 
-    Ok(())
+    auto_connect(&cli.host, &cli.socket).await
+}
+
+// -- Session picker --
+
+enum PickerAction {
+    Resume(String),
+    New,
+}
+
+fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &Option<String>) -> anyhow::Result<PickerAction> {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    let mut sel: usize = 0;
+    let mut out = std::io::stderr();
+    terminal::enable_raw_mode()?;
+    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+
+    let kill_session = |id: &str, host: &Option<String>, socket: &Option<String>| -> anyhow::Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let (mut r, mut w, _) = connect(host, socket).await?;
+            let wc = FrameCodec::new();
+            let mut rc = FrameCodec::new();
+            handshake(&wc, &mut rc, w.as_mut(), r.as_mut()).await?;
+            wc.write_message(w.as_mut(), &Message::SessionDestroy { id: id.into() }).await?;
+            let _ = rc.read_message(r.as_mut()).await;
+            Ok(())
+        })
+    };
+
+    let leave = |out: &mut std::io::Stderr| -> std::io::Result<()> {
+        execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
+        terminal::disable_raw_mode()?;
+        Ok(())
+    };
+
+    loop {
+        let total = sessions.len() + 1;
+
+        // Full redraw on clean screen
+        execute!(out, cursor::MoveTo(0, 0), terminal::Clear(terminal::ClearType::All))?;
+
+        write!(out, "  {:<18} {:<12} {:<24} {:<8} IDLE\r\n",
+            "NAME", "RUNNING", "CWD", "AGE")?;
+
+        if sel == 0 { write!(out, "\x1b[7m")?; }
+        write!(out, "{} [new session]\x1b[0m\r\n", if sel == 0 { ">" } else { " " })?;
+
+        for (i, s) in sessions.iter().enumerate() {
+            let idx = i + 1;
+            let proc_name = if s.foreground_proc.is_empty() { "-" } else { &s.foreground_proc };
+            let age = format_duration(s.created_secs);
+            let idle = format_duration(s.idle_secs);
+            let cwd = shorten_path(&s.cwd);
+
+            if s.attached {
+                write!(out, "\x1b[2m  {:<18} {:<12} {:<24} {:<8} {} (attached)\x1b[0m\r\n",
+                    s.id, proc_name, cwd, age, idle)?;
+            } else {
+                if sel == idx { write!(out, "\x1b[7m")?; }
+                write!(out, "{} {:<18} {:<12} {:<24} {:<8} {}\x1b[0m\r\n",
+                    if sel == idx { ">" } else { " " }, s.id, proc_name, cwd, age, idle)?;
+            }
+        }
+
+        write!(out, "\r\n")?;
+        write!(out, "  enter: select  x: kill  q: quit\r\n")?;
+        out.flush()?;
+
+        if sessions.is_empty() {
+            leave(&mut out)?;
+            return Ok(PickerAction::New);
+        }
+
+        if let Event::Key(ev @ KeyEvent { kind: KeyEventKind::Press, .. }) = event::read()? {
+            let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            let is_selectable = |idx: usize| -> bool {
+                idx == 0 || !sessions[idx - 1].attached
+            };
+
+            match ev.code {
+                KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                    let mut next = sel as i32 - 1;
+                    while next >= 0 {
+                        if is_selectable(next as usize) { sel = next as usize; break; }
+                        next -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                    let mut next = sel + 1;
+                    while next < total {
+                        if is_selectable(next) { sel = next; break; }
+                        next += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    leave(&mut out)?;
+                    if sel == 0 {
+                        return Ok(PickerAction::New);
+                    }
+                    return Ok(PickerAction::Resume(sessions[sel - 1].id.clone()));
+                }
+                KeyCode::Char('x') if !ctrl && sel > 0 && is_selectable(sel) => {
+                    let id = sessions[sel - 1].id.clone();
+                    kill_session(&id, host, socket)?;
+                    sessions.remove(sel - 1);
+                    if sel > sessions.len() {
+                        sel = sessions.len();
+                    }
+                    while sel > 0 && sel <= sessions.len() && sessions[sel - 1].attached {
+                        sel -= 1;
+                    }
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    leave(&mut out)?;
+                    std::process::exit(0);
+                }
+                KeyCode::Char('c' | 'd') if ctrl => {
+                    leave(&mut out)?;
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// -- Core logic --
+
+async fn auto_connect(
+    host: &Option<String>,
+    socket: &Option<String>,
+) -> anyhow::Result<()> {
+    let (mut reader, mut writer, _child) = connect(host, socket).await?;
+    let write_codec = FrameCodec::new();
+    let mut read_codec = FrameCodec::new();
+
+    handshake(&write_codec, &mut read_codec, writer.as_mut(), reader.as_mut()).await?;
+
+    write_codec
+        .write_message(writer.as_mut(), &Message::SessionList)
+        .await?;
+
+    let mut sessions = match read_codec.read_message(reader.as_mut()).await? {
+        Message::SessionListResp { sessions } => sessions,
+        _ => vec![],
+    };
+
+    let has_detached = sessions.iter().any(|s| !s.attached);
+
+    drop(reader);
+    drop(writer);
+
+    if sessions.is_empty() || !has_detached {
+        return run_session(host, socket, None, None, false).await;
+    }
+
+    match run_picker(&mut sessions, host, socket)? {
+        PickerAction::Resume(id) => {
+            run_session(host, socket, Some(id), None, true).await
+        }
+        PickerAction::New => {
+            run_session(host, socket, None, None, false).await
+        }
+    }
 }
 
 async fn connect(
@@ -117,7 +243,15 @@ async fn connect(
     Option<tokio::process::Child>,
 )> {
     if let Some(socket_path) = socket {
-        let stream = tokio::net::UnixStream::connect(socket_path).await?;
+        let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::anyhow!("daemon not running (socket not found: {socket_path})")
+            }
+            std::io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!("daemon not accepting connections ({socket_path})")
+            }
+            _ => anyhow::anyhow!("failed to connect to daemon at {socket_path}: {e}"),
+        })?;
         let (r, w) = stream.into_split();
         Ok((Box::new(r), Box::new(w), None))
     } else if let Some(host) = host {
@@ -128,12 +262,11 @@ async fn connect(
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Ok((Box::new(stdout), Box::new(stdin), Some(child)))
     } else {
-        anyhow::bail!("either --host or --socket must be specified");
+        anyhow::bail!("either host or --socket must be specified");
     }
 }
 
@@ -158,10 +291,14 @@ async fn handshake(
         )
         .await?;
 
-    match read_codec.read_message(reader).await? {
-        Message::HelloOk { .. } => Ok(()),
-        Message::Error { message, .. } => anyhow::bail!("server error: {message}"),
-        _ => anyhow::bail!("unexpected response to Hello"),
+    match read_codec.read_message(reader).await {
+        Ok(Message::HelloOk { .. }) => Ok(()),
+        Ok(Message::Error { message, .. }) => anyhow::bail!("server error: {message}"),
+        Ok(_) => anyhow::bail!("unexpected response to Hello"),
+        Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
+            anyhow::bail!("daemon not reachable — is tetherd running on the remote host?")
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -196,7 +333,6 @@ async fn run_session(
             .await?;
         id
     } else {
-        // Create session
         write_codec
             .write_message(
                 writer.as_mut(),
@@ -205,7 +341,7 @@ async fn run_session(
                     cmd,
                     cols,
                     rows,
-                    env: HashMap::new(),
+                    env: session_env(),
                 },
             )
             .await?;
@@ -216,7 +352,6 @@ async fn run_session(
             _ => anyhow::bail!("unexpected response"),
         };
 
-        // Now attach
         write_codec
             .write_message(
                 writer.as_mut(),
@@ -226,7 +361,6 @@ async fn run_session(
         id
     };
 
-    // Wait for SessionState snapshot, then enter raw mode with cleanup guard
     let _guard = match read_codec.read_message(reader.as_mut()).await? {
         Message::SessionState(state) => {
             let guard = RawModeGuard::enable()?;
@@ -237,15 +371,21 @@ async fn run_session(
                 cursor::MoveTo(0, 0)
             )?;
             render::render_snapshot(&state, &mut stdout)?;
+            stdout.write_all(b"\x1b[0m")?;
+            stdout.flush()?;
             guard
         }
-        Message::Error { message, .. } => {
-            anyhow::bail!("attach failed: {message}");
+        Message::HelloOk { .. } => {
+            let guard = RawModeGuard::enable()?;
+            // Clear so the session starts on a clean screen
+            std::io::stdout().write_all(b"\x1b[2J\x1b[H")?;
+            std::io::stdout().flush()?;
+            guard
         }
+        Message::Error { message, .. } => anyhow::bail!("attach failed: {message}"),
         _ => RawModeGuard::enable()?,
     };
 
-    // Main I/O loop — _guard ensures terminal is restored on any exit path
     io_loop(
         &write_codec,
         &mut read_codec,
@@ -265,10 +405,6 @@ async fn io_loop(
 ) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
 
-    // Dedicated thread reading raw bytes from fd 0 via direct syscall.
-    // Bypasses std::io::Stdin's BufReader to avoid any buffering issues
-    // in raw terminal mode. Cannot use tokio::io::stdin() in a select!
-    // loop either — its internal spawn_blocking loses data on cancellation.
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -285,20 +421,13 @@ async fn io_loop(
         }
     });
 
-    // Listen for SIGWINCH (terminal resize)
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-
-    // Catch SIGINT so it doesn't kill the process.
-    // In raw mode the terminal won't generate SIGINT from Ctrl-C (ISIG is off),
-    // but catch it anyway for robustness (e.g. `kill -INT` from another shell).
-    // Forward it as byte 0x03 to the PTY.
     let mut sigint =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
-            // Read from server
             result = read_codec.read_message(reader) => {
                 match result {
                     Ok(Message::Data(data)) => {
@@ -320,9 +449,7 @@ async fn io_loop(
                 }
             }
 
-            // Read raw bytes from dedicated stdin thread
             Some(data) = stdin_rx.recv() => {
-                // Check for detach key (Ctrl-\, 0x1c) anywhere in the chunk
                 if let Some(pos) = data.iter().position(|&b| b == DETACH_BYTE) {
                     if pos > 0 {
                         write_codec
@@ -339,7 +466,6 @@ async fn io_loop(
                     .await?;
             }
 
-            // Handle terminal resize
             _ = sigwinch.recv() => {
                 if let Ok((cols, rows)) = terminal::size() {
                     write_codec
@@ -348,7 +474,6 @@ async fn io_loop(
                 }
             }
 
-            // Handle SIGINT — forward as Ctrl-C byte to PTY
             _ = sigint.recv() => {
                 write_codec
                     .write_message(writer, &Message::Data(vec![0x03]))
@@ -358,71 +483,13 @@ async fn io_loop(
     }
 }
 
-async fn list_sessions(
-    host: &Option<String>,
-    socket: &Option<String>,
-) -> anyhow::Result<()> {
-    let (mut reader, mut writer, _child) = connect(host, socket).await?;
-    let write_codec = FrameCodec::new();
-    let mut read_codec = FrameCodec::new();
-
-    handshake(&write_codec, &mut read_codec, writer.as_mut(), reader.as_mut()).await?;
-
-    write_codec
-        .write_message(writer.as_mut(), &Message::SessionList)
-        .await?;
-
-    match read_codec.read_message(reader.as_mut()).await? {
-        Message::SessionListResp { sessions } => {
-            if sessions.is_empty() {
-                println!("no sessions");
-            } else {
-                println!("{:<20} {:<10} {:<10}", "NAME", "STATUS", "IDLE");
-                for s in sessions {
-                    let status = if s.attached { "attached" } else { "detached" };
-                    let idle = format_duration(s.idle_secs);
-                    println!("{:<20} {:<10} {:<10}", s.id, status, idle);
-                }
-            }
-        }
-        Message::Error { message, .. } => {
-            anyhow::bail!("error: {message}");
-        }
-        _ => anyhow::bail!("unexpected response"),
+fn session_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    env.insert("TERM".into(), "xterm-256color".into());
+    if let Ok(val) = std::env::var("COLORTERM") {
+        env.insert("COLORTERM".into(), val);
     }
-
-    Ok(())
-}
-
-async fn destroy_session(
-    host: &Option<String>,
-    socket: &Option<String>,
-    name: &str,
-) -> anyhow::Result<()> {
-    let (mut reader, mut writer, _child) = connect(host, socket).await?;
-    let write_codec = FrameCodec::new();
-    let mut read_codec = FrameCodec::new();
-
-    handshake(&write_codec, &mut read_codec, writer.as_mut(), reader.as_mut()).await?;
-
-    write_codec
-        .write_message(
-            writer.as_mut(),
-            &Message::SessionDestroy { id: name.into() },
-        )
-        .await?;
-
-    match read_codec.read_message(reader.as_mut()).await? {
-        Message::SessionCreated { id } => {
-            println!("destroyed session: {id}");
-        }
-        Message::Error { message, .. } => {
-            anyhow::bail!("error: {message}");
-        }
-        _ => anyhow::bail!("unexpected response"),
-    }
-
-    Ok(())
+    env
 }
 
 fn format_duration(secs: u64) -> String {
@@ -435,4 +502,13 @@ fn format_duration(secs: u64) -> String {
     } else {
         format!("{}d", secs / 86400)
     }
+}
+
+fn shorten_path(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(rest) = path.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
 }

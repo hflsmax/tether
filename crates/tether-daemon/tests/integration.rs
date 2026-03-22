@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-use tether_protocol::{FrameCodec, Message, ScreenMode, PROTOCOL_VERSION};
+use tether_protocol::{FrameCodec, Message, PROTOCOL_VERSION};
 
 async fn start_daemon(socket_path: &str) -> tokio::task::JoinHandle<()> {
     let config = tether_daemon::Config {
@@ -151,16 +151,13 @@ async fn test_attach_and_receive_output() {
         .await
         .unwrap();
 
-    // Should receive SessionState snapshot
+    // First attach returns HelloOk (no snapshot — shell just started)
     let resp = read_codec.read_message(&mut reader).await.unwrap();
-    match &resp {
-        Message::SessionState(state) => {
-            assert_eq!(state.cols, 80);
-            assert_eq!(state.rows, 24);
-            assert_eq!(state.screen_mode, ScreenMode::Main);
-        }
-        other => panic!("expected SessionState, got: {:?}", other),
-    }
+    assert!(
+        matches!(resp, Message::HelloOk { .. } | Message::SessionState(_)),
+        "expected HelloOk or SessionState, got: {:?}",
+        resp,
+    );
 
     // Send a command
     write_codec

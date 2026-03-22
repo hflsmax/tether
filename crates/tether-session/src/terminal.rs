@@ -152,13 +152,18 @@ fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
 }
 
 fn convert_color(color: &alacritty_terminal::vte::ansi::Color) -> Color {
+    use alacritty_terminal::vte::ansi::NamedColor;
     match color {
-        alacritty_terminal::vte::ansi::Color::Named(named) => Color {
-            r: 0,
-            g: 0,
-            b: 0,
-            kind: ColorKind::Indexed(*named as u8),
-        },
+        alacritty_terminal::vte::ansi::Color::Named(named) => {
+            let idx = *named as u16;
+            if idx >= NamedColor::Foreground as u16 {
+                // Foreground, Background, Cursor, Dim* — these are semantic
+                // colors that map to the terminal's defaults, not ANSI indices.
+                Color::default()
+            } else {
+                Color { r: 0, g: 0, b: 0, kind: ColorKind::Indexed(idx as u8) }
+            }
+        }
         alacritty_terminal::vte::ansi::Color::Spec(rgb) => Color {
             r: rgb.r,
             g: rgb.g,

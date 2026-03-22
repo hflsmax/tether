@@ -128,6 +128,7 @@ async fn handle_connection(
                     Ok(msg) => msg,
                     Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
                         if let Some(ref state) = attached {
+                            info!(session = %state.id, "client disconnected");
                             let mut reg = registry.lock().await;
                             reg.detach(&state.id);
                         }
@@ -182,11 +183,26 @@ async fn handle_connection(
                                     }
                                 };
 
-                                let snapshot = handle.snapshot(config.scrollback_lines).await;
-                                drop(reg); // release lock before writing
-                                write_codec
-                                    .write_message(&mut writer, &Message::SessionState(snapshot))
-                                    .await?;
+                                let first_attach = event_rx_opt.is_some();
+
+                                if first_attach {
+                                    // First attach: skip snapshot — shell just started
+                                    // and raw output with proper colors will follow.
+                                    drop(reg);
+                                    write_codec
+                                        .write_message(&mut writer, &Message::HelloOk { version: PROTOCOL_VERSION })
+                                        .await?;
+                                } else {
+                                    // Reattach: send snapshot to restore screen state.
+                                    let snapshot = handle.snapshot(config.scrollback_lines).await;
+                                    drop(reg);
+                                    write_codec
+                                        .write_message(&mut writer, &Message::SessionState(snapshot))
+                                        .await?;
+                                }
+
+                                let reattach = !first_attach;
+                                info!(session = %id, reattach, "client attached");
 
                                 attached = Some(AttachState {
                                     id: id.clone(),
@@ -194,7 +210,6 @@ async fn handle_connection(
                                     output_rx: rx,
                                 });
 
-                                // Spawn forwarding task: session events → output channel
                                 if let Some(mut erx) = event_rx_opt {
                                     let reg_clone = registry.clone();
                                     let session_id = id.clone();
@@ -208,10 +223,9 @@ async fn handle_connection(
                                                         reg.get_output_tx(&session_id).cloned()
                                                     };
                                                     if let Some(tx) = tx {
-                                                        // Use try_send to never block.
-                                                        // If full, output is still in the terminal
-                                                        // model and will appear in the next snapshot.
-                                                        let _ = tx.try_send(data);
+                                                        // Lock is already released, so this
+                                                        // send can't deadlock even if it blocks.
+                                                        let _ = tx.send(data).await;
                                                     }
                                                 }
                                                 SessionEvent::Exited(code) => {

@@ -176,6 +176,11 @@ impl Session {
 }
 
 impl SessionHandle {
+    /// Get the child process PID.
+    pub fn child_pid(&self) -> i32 {
+        self.pty_handle.child_pid.as_raw()
+    }
+
     /// Write input data to the PTY.
     pub fn write_input(&self, data: &[u8]) -> Result<(), SessionError> {
         let fd = self.pty_handle.master.raw_fd();
