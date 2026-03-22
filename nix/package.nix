@@ -4,7 +4,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "tether";
-  version = "0.1.0";
+  version = "0.1.3";
 
   src = lib.cleanSource self;
 

@@ -269,11 +269,11 @@ async fn test_destroy_session() {
         .write_message(&mut writer, &Message::SessionDestroy { id: "doomed".into() })
         .await
         .unwrap();
-    let _ = read_codec.read_message(&mut reader).await.unwrap();
+    let _ = read_non_data(&mut read_codec, &mut reader).await;
 
     // List should be empty
     write_codec.write_message(&mut writer, &Message::SessionList).await.unwrap();
-    let resp = read_codec.read_message(&mut reader).await.unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
     match resp {
         Message::SessionListResp { sessions } => {
             assert!(sessions.is_empty(), "session should be destroyed");
@@ -611,11 +611,11 @@ async fn test_resize() {
         .await
         .unwrap();
 
-    // Verify by checking $COLUMNS/$LINES inside the shell
+    // Verify by checking terminal size via stty (works in all shells including ash)
     send_and_expect(
         &write_codec, &mut read_codec, &mut reader, &mut writer,
-        "echo cols=$COLUMNS rows=$LINES\n",
-        "cols=120 rows=40",
+        "stty size\n",
+        "40 120",
     ).await;
 
     std::fs::remove_file(&socket_path).ok();
@@ -633,7 +633,7 @@ async fn test_session_list_shows_attached_status() {
 
     // While attached, list should show attached=true
     write_codec.write_message(&mut writer, &Message::SessionList).await.unwrap();
-    let resp = read_codec.read_message(&mut reader).await.unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
     match &resp {
         Message::SessionListResp { sessions } => {
             let s = sessions.iter().find(|s| s.id == "sess-a").unwrap();
@@ -1078,7 +1078,7 @@ async fn test_multiple_resize() {
 
     send_and_expect(
         &write_codec, &mut read_codec, &mut reader, &mut writer,
-        "echo cols=$COLUMNS rows=$LINES\n", "cols=80 rows=24",
+        "stty size\n", "24 80",
     ).await;
 
     std::fs::remove_file(&socket_path).ok();
