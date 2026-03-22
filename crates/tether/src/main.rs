@@ -528,6 +528,10 @@ async fn io_loop(
     let mut sigint =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    // Timeout for writes — if SSH is dead but hasn't closed the pipe,
+    // writes will block until the pipe buffer fills. This detects it early.
+    let write_timeout = std::time::Duration::from_secs(5);
+
     loop {
         tokio::select! {
             result = read_codec.read_message(reader) => {
@@ -552,34 +556,41 @@ async fn io_loop(
             }
 
             Some(data) = stdin_rx.recv() => {
-                if let Some(pos) = data.iter().position(|&b| b == DETACH_BYTE) {
-                    if pos > 0 {
-                        write_codec
-                            .write_message(writer, &Message::Data(data[..pos].to_vec()))
-                            .await?;
-                    }
-                    write_codec.write_message(writer, &Message::SessionDetach).await?;
+                // Ctrl-\ detaches immediately — don't wait for the write
+                if data.contains(&DETACH_BYTE) {
+                    // Best-effort send, don't block on dead connection
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        write_codec.write_message(writer, &Message::SessionDetach),
+                    ).await;
                     eprintln!("\r\n[detached from {}]", session_id);
                     return Ok(());
                 }
 
-                write_codec
-                    .write_message(writer, &Message::Data(data))
-                    .await?;
+                // Normal data — timeout protects against dead connection
+                match tokio::time::timeout(
+                    write_timeout,
+                    write_codec.write_message(writer, &Message::Data(data)),
+                ).await {
+                    Ok(Ok(())) => {}
+                    _ => anyhow::bail!("connection closed"),
+                }
             }
 
             _ = sigwinch.recv() => {
                 if let Ok((cols, rows)) = terminal::size() {
-                    write_codec
-                        .write_message(writer, &Message::Resize { cols, rows })
-                        .await?;
+                    let _ = tokio::time::timeout(
+                        write_timeout,
+                        write_codec.write_message(writer, &Message::Resize { cols, rows }),
+                    ).await;
                 }
             }
 
             _ = sigint.recv() => {
-                write_codec
-                    .write_message(writer, &Message::Data(vec![0x03]))
-                    .await?;
+                let _ = tokio::time::timeout(
+                    write_timeout,
+                    write_codec.write_message(writer, &Message::Data(vec![0x03])),
+                ).await;
             }
         }
     }
