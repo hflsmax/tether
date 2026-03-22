@@ -41,7 +41,7 @@ impl Server {
         // Spawn idle timeout checker
         let registry_timeout = self.registry.clone();
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(60));
+            let mut interval = time::interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 let mut reg = registry_timeout.lock().await;
