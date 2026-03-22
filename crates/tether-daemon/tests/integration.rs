@@ -880,3 +880,504 @@ async fn test_auto_generated_session_id() {
 
     std::fs::remove_file(&socket_path).ok();
 }
+
+// -- Shell and environment tests --
+
+/// Helper: create a session with a specific shell and env, attach, run a command, check output.
+async fn session_with_shell(
+    socket_path: &str,
+    session_id: &str,
+    shell: &str,
+    env: HashMap<String, String>,
+    command: &str,
+    marker: &str,
+) {
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    write_codec
+        .write_message(
+            &mut writer,
+            &Message::SessionCreate {
+                id: Some(session_id.into()),
+                cmd: Some(shell.into()),
+                cols: 80,
+                rows: 24,
+                env,
+            },
+        )
+        .await
+        .unwrap();
+    let resp = read_codec.read_message(&mut reader).await.unwrap();
+    assert!(matches!(resp, Message::SessionCreated { .. }), "failed to create session with {shell}");
+
+    write_codec
+        .write_message(&mut writer, &Message::SessionAttach { id: session_id.into() })
+        .await
+        .unwrap();
+    let _ = read_codec.read_message(&mut reader).await.unwrap();
+
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, command, marker).await;
+}
+
+#[tokio::test]
+async fn test_shell_bash() {
+    let bash = "/run/current-system/sw/bin/bash";
+    if !std::path::Path::new(bash).exists() {
+        eprintln!("skipping: bash not found at {bash}");
+        return;
+    }
+    let socket_path = test_socket_path("bash");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let mut env = HashMap::new();
+    env.insert("TERM".into(), "xterm-256color".into());
+    session_with_shell(
+        &socket_path, "bash-sess", bash, env,
+        "echo bash-works\n", "bash-works",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_shell_sh() {
+    let socket_path = test_socket_path("sh");
+    let _daemon = start_daemon(&socket_path).await;
+
+    session_with_shell(
+        &socket_path, "sh-sess", "/bin/sh", HashMap::new(),
+        "echo sh-works\n", "sh-works",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_shell_zsh() {
+    if !std::path::Path::new("/run/current-system/sw/bin/zsh").exists() {
+        eprintln!("skipping: zsh not found");
+        return;
+    }
+    let socket_path = test_socket_path("zsh");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let mut env = HashMap::new();
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("ZDOTDIR".into(), "/nonexistent".into());
+
+    session_with_shell(
+        &socket_path, "zsh-sess", "/run/current-system/sw/bin/zsh", env,
+        "echo zsh-works\n", "zsh-works",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_rapid_input() {
+    let socket_path = test_socket_path("rapid");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "rapid-test").await;
+
+    for i in 0..50 {
+        write_codec
+            .write_message(&mut writer, &Message::Data(format!("echo r{i}\n").as_bytes().to_vec()))
+            .await
+            .unwrap();
+    }
+
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, "echo rapid-done\n", "rapid-done").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_large_output() {
+    let socket_path = test_socket_path("large-out");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "large-test").await;
+
+    write_codec
+        .write_message(&mut writer, &Message::Data(b"seq 1 500\n".to_vec()))
+        .await
+        .unwrap();
+
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, "echo large-done\n", "large-done").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_binary_data_passthrough() {
+    let socket_path = test_socket_path("binary");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "binary-test").await;
+
+    send_and_expect(
+        &write_codec, &mut read_codec, &mut reader, &mut writer,
+        "printf '\\x48\\x45\\x4c\\x4c\\x4f'\n", "HELLO",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_special_characters() {
+    let socket_path = test_socket_path("special-chars");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "special-test").await;
+
+    send_and_expect(
+        &write_codec, &mut read_codec, &mut reader, &mut writer,
+        "echo 'hello-utf8'\n", "hello-utf8",
+    ).await;
+
+    send_and_expect(
+        &write_codec, &mut read_codec, &mut reader, &mut writer,
+        "printf 'A\\tB\\tC\\n'\n", "A",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_multiple_resize() {
+    let socket_path = test_socket_path("multi-resize");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "resize-multi").await;
+
+    for (cols, rows) in [(100, 30), (60, 20), (200, 50), (80, 24)] {
+        write_codec
+            .write_message(&mut writer, &Message::Resize { cols, rows })
+            .await
+            .unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    send_and_expect(
+        &write_codec, &mut read_codec, &mut reader, &mut writer,
+        "echo cols=$COLUMNS rows=$LINES\n", "cols=80 rows=24",
+    ).await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_detach_reattach_multiple_times() {
+    let socket_path = test_socket_path("multi-reattach");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "bounce").await;
+    send_and_expect(&wc, &mut rc, &mut r, &mut w, "echo round-0\n", "round-0").await;
+
+    for i in 1..=5 {
+        wc.write_message(&mut w, &Message::SessionDetach).await.unwrap();
+        drop(w);
+        drop(r);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+        let (mut r2, mut w2) = stream2.into_split();
+
+        wc2.write_message(&mut w2, &Message::SessionAttach { id: "bounce".into() })
+            .await
+            .unwrap();
+        let resp = rc2.read_message(&mut r2).await.unwrap();
+        assert!(matches!(resp, Message::SessionState(_)), "reattach {i} should get snapshot");
+
+        let marker = format!("round-{i}");
+        send_and_expect(&wc2, &mut rc2, &mut r2, &mut w2, &format!("echo {marker}\n"), &marker).await;
+
+        w = w2;
+        r = r2;
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_session_survives_client_crash() {
+    let socket_path = test_socket_path("survive-crash");
+    let _daemon = start_daemon(&socket_path).await;
+
+    {
+        let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+        let (mut r, mut w) = stream.into_split();
+        create_and_attach(&wc, &mut rc, &mut r, &mut w, "survivor").await;
+        send_and_expect(&wc, &mut rc, &mut r, &mut w, "echo before-crash\n", "before-crash").await;
+        // Drop without detaching — simulates client crash
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "survivor".into() })
+        .await
+        .unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)));
+
+    send_and_expect(&wc2, &mut rc2, &mut r2, &mut w2, "echo after-crash\n", "after-crash").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_switch_sessions_on_same_connection() {
+    let socket_path = test_socket_path("switch-sess");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "sess-a").await;
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, "echo in-a\n", "in-a").await;
+
+    // Create B without detaching from A
+    write_codec
+        .write_message(
+            &mut writer,
+            &Message::SessionCreate {
+                id: Some("sess-b".into()),
+                cmd: Some("/bin/sh".into()),
+                cols: 80,
+                rows: 24,
+                env: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
+    assert!(matches!(resp, Message::SessionCreated { .. }));
+
+    // Attach to B (auto-detaches from A)
+    write_codec
+        .write_message(&mut writer, &Message::SessionAttach { id: "sess-b".into() })
+        .await
+        .unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
+    assert!(matches!(resp, Message::HelloOk { .. } | Message::SessionState(_)));
+
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, "echo in-b\n", "in-b").await;
+
+    // Verify A is detached, B is attached
+    write_codec.write_message(&mut writer, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
+    match resp {
+        Message::SessionListResp { sessions } => {
+            let a = sessions.iter().find(|s| s.id == "sess-a").unwrap();
+            let b = sessions.iter().find(|s| s.id == "sess-b").unwrap();
+            assert!(!a.attached, "A should be detached");
+            assert!(b.attached, "B should be attached");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_long_running_command_survives_detach() {
+    let socket_path = test_socket_path("long-cmd");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "long-cmd").await;
+
+    wc.write_message(&mut w, &Message::Data(b"(sleep 1 && echo long-cmd-finished) &\n".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    wc.write_message(&mut w, &Message::SessionDetach).await.unwrap();
+    drop(w);
+    drop(r);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "long-cmd".into() })
+        .await
+        .unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+
+    match &resp {
+        Message::SessionState(state) => {
+            let all_text: String = state
+                .visible_rows
+                .iter()
+                .chain(state.scrollback.iter())
+                .flat_map(|row| row.cells.iter().map(|c| c.c))
+                .collect();
+            assert!(
+                all_text.contains("long-cmd-finished"),
+                "snapshot should contain output from command that ran while detached"
+            );
+        }
+        other => panic!("expected SessionState, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_different_terminal_sizes() {
+    let socket_path = test_socket_path("termsizes");
+    let _daemon = start_daemon(&socket_path).await;
+
+    for (cols, rows, label) in [(40, 10, "small"), (132, 43, "wide"), (80, 24, "standard")] {
+        let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_codec
+            .write_message(
+                &mut writer,
+                &Message::SessionCreate {
+                    id: Some(format!("size-{label}")),
+                    cmd: Some("/bin/sh".into()),
+                    cols,
+                    rows,
+                    env: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = read_codec.read_message(&mut reader).await.unwrap();
+
+        write_codec
+            .write_message(&mut writer, &Message::SessionAttach { id: format!("size-{label}") })
+            .await
+            .unwrap();
+        let _ = read_codec.read_message(&mut reader).await.unwrap();
+
+        send_and_expect(
+            &write_codec, &mut read_codec, &mut reader, &mut writer,
+            &format!("echo size-{cols}x{rows}\n"),
+            &format!("size-{cols}x{rows}"),
+        ).await;
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_multiple_pings() {
+    let socket_path = test_socket_path("multi-ping");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    for i in 0..20u32 {
+        write_codec.write_message(&mut writer, &Message::Ping { seq: i }).await.unwrap();
+    }
+
+    for i in 0..20u32 {
+        let resp = read_codec.read_message(&mut reader).await.unwrap();
+        assert_eq!(resp, Message::Pong { seq: i }, "pong {i} out of order");
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_empty_data_message() {
+    let socket_path = test_socket_path("empty-data");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "empty-data").await;
+
+    write_codec
+        .write_message(&mut writer, &Message::Data(vec![]))
+        .await
+        .unwrap();
+
+    send_and_expect(&write_codec, &mut read_codec, &mut reader, &mut writer, "echo still-alive\n", "still-alive").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_session_cwd_changes() {
+    let socket_path = test_socket_path("cwd-change");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "cwd-test").await;
+
+    write_codec
+        .write_message(&mut writer, &Message::Data(b"cd /tmp\n".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    write_codec.write_message(&mut writer, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
+    match resp {
+        Message::SessionListResp { sessions } => {
+            let s = sessions.iter().find(|s| s.id == "cwd-test").unwrap();
+            assert!(s.cwd.contains("tmp"), "cwd should contain 'tmp', got: {}", s.cwd);
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[tokio::test]
+async fn test_foreground_process_reported() {
+    let socket_path = test_socket_path("fg-proc");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "fg-test").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    write_codec.write_message(&mut writer, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut read_codec, &mut reader).await;
+    match resp {
+        Message::SessionListResp { sessions } => {
+            let s = sessions.iter().find(|s| s.id == "fg-test").unwrap();
+            assert!(!s.foreground_proc.is_empty(), "foreground_proc should be non-empty");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
