@@ -36,11 +36,8 @@ impl Drop for RawModeGuard {
 }
 
 /// Persistent terminal sessions over SSH
-///
-/// Usage: tether <user@host>
-///        tether --socket <path>
 #[derive(Parser)]
-#[command(name = "tether")]
+#[command(name = "tether", override_usage = "tether <user@host>\n       tether --socket <path>")]
 struct Cli {
     /// Remote host (user@host)
     host: Option<String>,
@@ -63,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.host.is_none() && cli.socket.is_none() {
-        anyhow::bail!("usage: tether <user@host>\n       tether --socket <path>");
+        // Use clap's built-in help instead of a manual message
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        std::process::exit(1);
     }
 
     auto_connect(&cli.host, &cli.socket).await
