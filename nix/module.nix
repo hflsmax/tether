@@ -18,8 +18,8 @@ in
 
     users = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
-      description = "Users to run tetherd for. Each gets a system service that starts at boot.";
+      default = lib.attrNames (lib.filterAttrs (_: u: u.isNormalUser) config.users.users);
+      description = "Users to run tetherd for. Defaults to all normal users.";
       example = [ "alice" "bob" ];
     };
 
