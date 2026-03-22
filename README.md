@@ -120,13 +120,13 @@ All settings are optional — the defaults above apply if the file doesn't exist
 
 ## Comparison
 
-| | tether | tmux | Eternal Terminal |
-|---|---|---|---|
-| Transport | SSH (no extra ports) | local only | Custom TCP (port 2022) |
-| Reconnect | automatic | manual reattach | automatic |
-| Terminal emulation | passthrough | nested (double-escape issues) | passthrough |
-| Session persistence | daemon keeps PTY alive | server keeps PTY alive | server keeps PTY alive |
-| Setup | daemon + proxy in PATH | install tmux | install etserver, open port |
+| | tether | [tmux](https://github.com/tmux/tmux) | [Eternal Terminal](https://github.com/MystenLabs/EternalTerminal) | [mosh](https://github.com/mobile-shell/mosh) |
+|---|---|---|---|---|
+| Transport | SSH (no extra ports) | local only | Custom TCP (port 2022) | Custom UDP (port 60000+) |
+| Reconnect | automatic | manual reattach | automatic | automatic |
+| Terminal emulation | passthrough | nested (double-escape issues) | passthrough | custom (SSP) |
+| Session persistence | daemon keeps PTY alive | server keeps PTY alive | server keeps PTY alive | server keeps PTY alive |
+| Setup | daemon + proxy in PATH | install tmux | install etserver, open port | install mosh-server, open UDP ports |
 
 ## Building from source
 
