@@ -69,6 +69,11 @@ in
           # systemd creates /run/tether/<user> with correct ownership
           RuntimeDirectory = "tether/${user}";
           RuntimeDirectoryMode = "0700";
+        } // lib.optionalAttrs (config.users.users.${user}.uid != null) {
+          # Place under the user's cgroup slice so monitoring tools
+          # (e.g. Grafana) attribute session processes to the user,
+          # not to "systemd".
+          Slice = "user-${toString config.users.users.${user}.uid}.slice";
         };
       };
     }) cfg.users);
