@@ -36,9 +36,16 @@ The daemon owns the PTY sessions and tracks terminal state with [alacritty_termi
 Download from [releases](https://github.com/hflsmax/tether/releases):
 
 ```sh
-curl -L https://github.com/hflsmax/tether/releases/latest/download/tether-aarch64-apple-darwin -o /usr/local/bin/tether
-chmod +x /usr/local/bin/tether
-codesign -s - /usr/local/bin/tether  # required on macOS
+mkdir -p ~/.local/bin
+curl -L https://github.com/hflsmax/tether/releases/latest/download/tether-aarch64-apple-darwin -o ~/.local/bin/tether
+chmod +x ~/.local/bin/tether
+codesign -s - ~/.local/bin/tether
+```
+
+Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc`):
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### Server (NixOS)
