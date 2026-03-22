@@ -39,7 +39,6 @@ Download from [releases](https://github.com/hflsmax/tether/releases):
 mkdir -p ~/.local/bin
 curl -L https://github.com/hflsmax/tether/releases/latest/download/tether-aarch64-apple-darwin -o ~/.local/bin/tether
 chmod +x ~/.local/bin/tether
-codesign -s - ~/.local/bin/tether
 ```
 
 Add `~/.local/bin` to your PATH if needed (add to `~/.zshrc`):
