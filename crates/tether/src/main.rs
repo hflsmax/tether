@@ -49,6 +49,16 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Restore terminal on panic so the user's shell isn't left in raw mode
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(std::io::stdout(), cursor::Show);
+        let _ = std::io::stdout().write_all(b"\r\n");
+        let _ = std::io::stdout().flush();
+        default_panic(info);
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
