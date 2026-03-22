@@ -5,7 +5,7 @@ use tracing::info;
 use tether_daemon::{Config, Server};
 
 #[derive(Parser)]
-#[command(name = "tetherd", about = "Tether daemon — persistent PTY session manager")]
+#[command(name = "tetherd", version, about = "Tether daemon — persistent PTY session manager")]
 struct Cli {
     /// Path to config file
     #[arg(short, long)]
