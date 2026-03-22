@@ -16,6 +16,13 @@ in
       description = "The tether package to use.";
     };
 
+    users = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      description = "Users to run tetherd for. Each gets a system service that starts at boot.";
+      example = [ "alice" "bob" ];
+    };
+
     settings = {
       idleTimeout = lib.mkOption {
         type = lib.types.str;
@@ -40,7 +47,6 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    # System-wide config file
     environment.etc."tether/config.toml".text = ''
       idle_timeout = "${cfg.settings.idleTimeout}"
       scrollback_lines = ${toString cfg.settings.scrollbackLines}
@@ -48,15 +54,21 @@ in
       socket_path = ""
     '';
 
-    # Systemd user unit — runs per-user when any user logs in
-    systemd.user.services.tetherd = {
-      description = "Tether daemon";
-      wantedBy = [ "default.target" ];
-      serviceConfig = {
-        ExecStart = "${cfg.package}/bin/tetherd --config /etc/tether/config.toml";
-        Restart = "on-failure";
-        RestartSec = 5;
+    # One system service per user, starts at boot (before any SSH/tether connection)
+    systemd.services = lib.listToAttrs (map (user: {
+      name = "tetherd-${user}";
+      value = {
+        description = "Tether daemon for ${user}";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ];
+        serviceConfig = {
+          User = user;
+          ExecStart = "${cfg.package}/bin/tetherd --config /etc/tether/config.toml";
+          Restart = "on-failure";
+          RestartSec = 5;
+          RuntimeDirectory = "user/%U";
+        };
       };
-    };
+    }) cfg.users);
   };
 }
