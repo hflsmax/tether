@@ -77,6 +77,20 @@ fn socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("TETHER_SOCKET") {
         return PathBuf::from(path);
     }
+    // Try XDG_RUNTIME_DIR first (Home Manager / manual setup)
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let path = PathBuf::from(&runtime_dir).join("tether.sock");
+        if path.exists() {
+            return path;
+        }
+    }
+    // Try /run/tether/<user>/ (NixOS system module)
+    let user = std::env::var("USER").unwrap_or_default();
+    let system_path = PathBuf::from(format!("/run/tether/{user}/tether.sock"));
+    if system_path.exists() {
+        return system_path;
+    }
+    // Default fallback
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
     PathBuf::from(runtime_dir).join("tether.sock")

@@ -5,6 +5,14 @@ self:
 let
   cfg = config.services.tether;
   tether = self.packages.${pkgs.stdenv.hostPlatform.system}.tether;
+
+  # Per-user config with a socket path that doesn't require login
+  userConfig = user: pkgs.writeText "tether-${user}.toml" ''
+    idle_timeout = "${cfg.settings.idleTimeout}"
+    scrollback_lines = ${toString cfg.settings.scrollbackLines}
+    max_sessions = ${toString cfg.settings.maxSessions}
+    socket_path = "/run/tether/${user}/tether.sock"
+  '';
 in
 {
   options.services.tether = {
@@ -47,14 +55,6 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    environment.etc."tether/config.toml".text = ''
-      idle_timeout = "${cfg.settings.idleTimeout}"
-      scrollback_lines = ${toString cfg.settings.scrollbackLines}
-      max_sessions = ${toString cfg.settings.maxSessions}
-      socket_path = ""
-    '';
-
-    # One system service per user, starts at boot (before any SSH/tether connection)
     systemd.services = lib.listToAttrs (map (user: {
       name = "tetherd-${user}";
       value = {
@@ -63,10 +63,12 @@ in
         after = [ "network.target" ];
         serviceConfig = {
           User = user;
-          ExecStart = "${cfg.package}/bin/tetherd --config /etc/tether/config.toml";
+          ExecStart = "${cfg.package}/bin/tetherd --config ${userConfig user}";
           Restart = "on-failure";
           RestartSec = 5;
-          RuntimeDirectory = "user/%U";
+          # systemd creates /run/tether/<user> with correct ownership
+          RuntimeDirectory = "tether/${user}";
+          RuntimeDirectoryMode = "0700";
         };
       };
     }) cfg.users);
