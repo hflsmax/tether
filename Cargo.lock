@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "tether"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "tether-daemon"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "nix",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "tether-protocol"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "bitflags",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "tether-proxy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "nix",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "tether-session"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "alacritty_terminal",
  "bytes",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "tetherd"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
