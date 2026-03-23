@@ -399,6 +399,23 @@ async fn run_session(
         _ => RawModeGuard::enable()?,
     };
 
+    // Spawn a stdin reader thread — shared across io_loop and reconnection
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n <= 0 {
+                break;
+            }
+            if stdin_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
     // I/O loop with automatic reconnection on connection loss
     let result = io_loop(
         &write_codec,
@@ -406,6 +423,7 @@ async fn run_session(
         writer.as_mut(),
         reader.as_mut(),
         &session_id,
+        &mut stdin_rx,
     )
     .await;
 
@@ -434,13 +452,23 @@ async fn run_session(
             loop {
                 {
                     let mut out = std::io::stdout();
-                    let _ = write!(out, "\r\n[connection lost, reconnecting in {}s...]\r\n",
+                    let _ = write!(out, "\r\n[connection lost, reconnecting in {}s... ctrl-c to quit]\r\n",
                         delay.as_secs().max(1));
                     let _ = out.flush();
                 }
-                tokio::time::sleep(delay).await;
 
-                match reconnect_session(host, socket, &session_id).await {
+                // Wait for delay, but allow user to interrupt
+                let interrupted = tokio::select! {
+                    _ = tokio::time::sleep(delay) => false,
+                    Some(data) = stdin_rx.recv() => {
+                        data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04)
+                    }
+                };
+                if interrupted {
+                    return Ok(());
+                }
+
+                match reconnect_session(host, socket, &session_id, &mut stdin_rx).await {
                     Ok(()) => return Ok(()),
                     Err(_) => {
                         delay = (delay * 2).min(max_delay);
@@ -455,6 +483,7 @@ async fn reconnect_session(
     host: &Option<String>,
     socket: &Option<String>,
     session_id: &str,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer, mut _child) = connect(host, socket).await?;
     let write_codec = FrameCodec::new();
@@ -504,6 +533,7 @@ async fn reconnect_session(
         writer.as_mut(),
         reader.as_mut(),
         session_id,
+        stdin_rx,
     )
     .await
 }
@@ -514,24 +544,9 @@ async fn io_loop(
     writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     session_id: &str,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
-
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = unsafe {
-                libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
-            if n <= 0 {
-                break;
-            }
-            if stdin_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
 
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
