@@ -124,7 +124,7 @@ jobs:
           EOF
 
           # Push updated formula
-          gh repo clone hflsmax/homebrew-tether /tmp/homebrew-tether
+          git clone https://x-access-token:${GH_TOKEN}@github.com/hflsmax/homebrew-tether.git /tmp/homebrew-tether
           cp /tmp/tether.rb /tmp/homebrew-tether/Formula/tether.rb
           cd /tmp/homebrew-tether
           git config user.name "github-actions[bot]"
