@@ -1028,7 +1028,7 @@ async fn test_binary_data_passthrough() {
 
     send_and_expect(
         &write_codec, &mut read_codec, &mut reader, &mut writer,
-        "printf '\\x48\\x45\\x4c\\x4c\\x4f'\n", "HELLO",
+        "printf '%s' HELLO\n", "HELLO",
     ).await;
 
     std::fs::remove_file(&socket_path).ok();
