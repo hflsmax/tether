@@ -35,7 +35,11 @@ The daemon owns the PTY sessions and tracks terminal state with [alacritty_termi
 
 ### Client (macOS)
 
-Download from [releases](https://github.com/hflsmax/tether/releases):
+```sh
+brew install hflsmax/tether/tether
+```
+
+Or download manually from [releases](https://github.com/hflsmax/tether/releases):
 
 ```sh
 mkdir -p ~/.local/bin

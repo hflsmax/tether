@@ -88,3 +88,48 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             artifacts/tether-*/*
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA_ARM=$(sha256sum artifacts/tether-aarch64-apple-darwin/tether-aarch64-apple-darwin | cut -d' ' -f1)
+          SHA_X86=$(sha256sum artifacts/tether-x86_64-apple-darwin/tether-x86_64-apple-darwin | cut -d' ' -f1)
+
+          cat > /tmp/tether.rb <<EOF
+          class Tether < Formula
+            desc "Persistent terminal sessions over SSH"
+            homepage "https://github.com/hflsmax/tether"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/hflsmax/tether/releases/download/${GITHUB_REF_NAME}/tether-aarch64-apple-darwin"
+                sha256 "$SHA_ARM"
+              else
+                url "https://github.com/hflsmax/tether/releases/download/${GITHUB_REF_NAME}/tether-x86_64-apple-darwin"
+                sha256 "$SHA_X86"
+              end
+            end
+
+            def install
+              binary = Dir["tether-*"].first || "tether"
+              bin.install binary => "tether"
+            end
+
+            test do
+              assert_match "tether #{version}", shell_output("#{bin}/tether --version")
+            end
+          end
+          EOF
+
+          # Push updated formula
+          gh repo clone hflsmax/homebrew-tether /tmp/homebrew-tether
+          cp /tmp/tether.rb /tmp/homebrew-tether/Formula/tether.rb
+          cd /tmp/homebrew-tether
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/tether.rb
+          git commit -m "Update tether to $VERSION"
+          git push
