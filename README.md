@@ -175,7 +175,7 @@ max_sessions = 20          # max concurrent sessions per user
 
 All settings are optional — the defaults above apply if the file doesn't exist.
 
-On NixOS, configuration is managed via `services.tether.settings` in your NixOS config — the daemon receives a generated config file via `--config`, so `~/.config/tether/config.toml` is not used.
+On NixOS, configuration is managed via `services.tether.settings` in your NixOS config — the daemon receives a generated config file via `--config`.
 
 ## Comparison
 
