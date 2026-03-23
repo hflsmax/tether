@@ -34,6 +34,11 @@ jobs:
           for bin in tether tetherd tether-proxy; do
             cp $bin ../../../${bin}-${{ matrix.target }}
           done
+      - name: Build .deb
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash dist/build-deb.sh ${{ matrix.target }} "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: tether-${{ matrix.target }}
@@ -41,6 +46,7 @@ jobs:
             tether-${{ matrix.target }}
             tetherd-${{ matrix.target }}
             tether-proxy-${{ matrix.target }}
+            tether_*.deb
 
   build-macos:
     runs-on: ubuntu-latest
