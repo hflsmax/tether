@@ -27,7 +27,11 @@ Local Machine                     Remote Machine
                               └──────────────────────────┘
 ```
 
-The daemon owns the PTY sessions and tracks terminal state with [alacritty_terminal](https://github.com/alacritty/alacritty). When you reconnect, it sends a structured snapshot of the screen — not a raw escape sequence replay. The client renders the snapshot and resumes live I/O. Sessions persist until you close them or they idle out.
+Three binaries, each with a single job:
+
+- **`tether`** (client, runs on your laptop) — connects to the remote host over SSH, displays the session picker, and handles terminal I/O. Automatically reconnects on network loss.
+- **`tether-proxy`** (remote) — invoked by SSH on the remote host. Bridges SSH's stdin/stdout to the daemon's Unix socket. Stateless and lightweight.
+- **`tetherd`** (remote, long-running daemon) — manages persistent PTY sessions. Tracks terminal state with [alacritty_terminal](https://github.com/alacritty/alacritty) so reconnections get a structured screen snapshot — not a raw escape sequence replay. Sessions persist until you close them or they idle out.
 
 ## Install
 
