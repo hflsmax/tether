@@ -14,7 +14,12 @@ case "$TARGET" in
     *) echo "Unsupported target: $TARGET"; exit 1 ;;
 esac
 
-BINDIR="target/${TARGET}/release"
+# Support both `cargo build --release` and `cargo build --release --target <target>`
+if [ -d "target/${TARGET}/release" ]; then
+    BINDIR="target/${TARGET}/release"
+else
+    BINDIR="target/release"
+fi
 PKG="tether_${VERSION}_${ARCH}"
 ROOT="$PKG"
 
