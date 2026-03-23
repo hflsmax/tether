@@ -89,7 +89,7 @@ jobs:
             artifacts/tether-*/*
       - name: Update Homebrew formula
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           SHA_ARM=$(sha256sum artifacts/tether-aarch64-apple-darwin/tether-aarch64-apple-darwin | cut -d' ' -f1)
