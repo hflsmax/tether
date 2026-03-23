@@ -85,18 +85,41 @@ services.tether.settings = {
 services.tether.users = [ "alice" "bob" ];
 ```
 
-### Server (other Linux)
+### Server (Ubuntu / Debian / other Linux)
+
+One-line install (requires root):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hflsmax/tether/main/dist/install.sh | sudo bash
+```
+
+Then enable for your user:
+
+```sh
+sudo systemctl enable --now tetherd@$USER
+```
+
+This installs `tetherd` and `tether-proxy` to `/usr/local/bin` and sets up a systemd service. Sessions are available immediately when SSH connects.
+
+#### Manual install
 
 Download the server binaries from [releases](https://github.com/hflsmax/tether/releases):
 
 ```sh
-mkdir -p ~/.local/bin
-curl -L https://github.com/hflsmax/tether/releases/latest/download/tetherd-x86_64-unknown-linux-gnu -o ~/.local/bin/tetherd
-curl -L https://github.com/hflsmax/tether/releases/latest/download/tether-proxy-x86_64-unknown-linux-gnu -o ~/.local/bin/tether-proxy
-chmod +x ~/.local/bin/tetherd ~/.local/bin/tether-proxy
+sudo curl -fSL https://github.com/hflsmax/tether/releases/latest/download/tetherd-x86_64-unknown-linux-gnu -o /usr/local/bin/tetherd
+sudo curl -fSL https://github.com/hflsmax/tether/releases/latest/download/tether-proxy-x86_64-unknown-linux-gnu -o /usr/local/bin/tether-proxy
+sudo chmod +x /usr/local/bin/tetherd /usr/local/bin/tether-proxy
 ```
 
-Start the daemon (or add to your init system):
+Install the systemd service and enable for your user:
+
+```sh
+sudo cp dist/tetherd@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tetherd@$USER
+```
+
+Or run manually:
 
 ```sh
 tetherd  # listens on $XDG_RUNTIME_DIR/tether.sock
