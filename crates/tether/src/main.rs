@@ -468,9 +468,56 @@ async fn run_session(
                     return Ok(());
                 }
 
-                match reconnect_session(host, socket, &session_id, &mut stdin_rx).await {
-                    Ok(()) => return Ok(()),
-                    Err(_) => {
+                // Reconnect attempt — interruptible via stdin, with timeout.
+                // try_reconnect doesn't borrow stdin_rx, so we can select.
+                let reconnect_timeout = std::time::Duration::from_secs(15);
+                let result = tokio::select! {
+                    r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
+                        match r {
+                            Ok(inner) => inner,
+                            Err(_) => Err(anyhow::anyhow!("reconnect timed out")),
+                        }
+                    }
+                    Some(data) = stdin_rx.recv() => {
+                        if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                            return Ok(());
+                        }
+                        Err(anyhow::anyhow!("interrupted"))
+                    }
+                };
+                match result {
+                    Ok((reader, writer, read_codec, write_codec, _child)) => {
+                        {
+                            let mut out = std::io::stdout();
+                            let _ = write!(out, "\r\n[reconnected]\r\n");
+                            let _ = out.flush();
+                        }
+                        let mut reader = reader;
+                        let mut writer = writer;
+                        let mut read_codec = read_codec;
+                        let result = io_loop(
+                            &write_codec,
+                            &mut read_codec,
+                            writer.as_mut(),
+                            reader.as_mut(),
+                            &session_id,
+                            &mut stdin_rx,
+                        ).await;
+                        match result {
+                            Ok(()) => return Ok(()),
+                            Err(_) => {
+                                delay = std::time::Duration::from_millis(100);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.contains("reattach failed") {
+                            let mut out = std::io::stdout();
+                            let _ = write!(out, "\r\n[session no longer exists]\r\n");
+                            let _ = out.flush();
+                            return Ok(());
+                        }
                         delay = (delay * 2).min(max_delay);
                     }
                 }
@@ -479,13 +526,20 @@ async fn run_session(
     }
 }
 
-async fn reconnect_session(
+/// Attempt to reconnect and reattach to a session. Returns the connection
+/// components on success so the caller can enter io_loop with stdin_rx.
+async fn try_reconnect(
     host: &Option<String>,
     socket: &Option<String>,
     session_id: &str,
-    stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-) -> anyhow::Result<()> {
-    let (mut reader, mut writer, mut _child) = connect(host, socket).await?;
+) -> anyhow::Result<(
+    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    FrameCodec,
+    FrameCodec,
+    Option<tokio::process::Child>,
+)> {
+    let (mut reader, mut writer, _child) = connect(host, socket).await?;
     let write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
 
@@ -521,21 +575,7 @@ async fn reconnect_session(
         _ => {}
     }
 
-    {
-        let mut out = std::io::stdout();
-        let _ = write!(out, "\r\n[reconnected]\r\n");
-        let _ = out.flush();
-    }
-
-    io_loop(
-        &write_codec,
-        &mut read_codec,
-        writer.as_mut(),
-        reader.as_mut(),
-        session_id,
-        stdin_rx,
-    )
-    .await
+    Ok((reader, writer, read_codec, write_codec, _child))
 }
 
 async fn io_loop(
