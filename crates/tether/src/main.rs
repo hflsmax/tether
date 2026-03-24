@@ -7,7 +7,7 @@ use std::process::Stdio;
 use clap::Parser;
 use crossterm::{cursor, execute, terminal};
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use tether_protocol::{FrameCodec, Message, SessionInfo, PROTOCOL_VERSION};
 
@@ -45,6 +45,15 @@ struct Cli {
     /// Use direct Unix socket connection (no SSH)
     #[arg(long)]
     socket: Option<String>,
+
+    /// Enable verbose logging (-v info, -vv debug, -vvv trace).
+    /// Logs to ~/.local/share/tether/tether.log
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Override log file path
+    #[arg(long)]
+    log_file: Option<String>,
 }
 
 #[tokio::main]
@@ -59,15 +68,47 @@ async fn main() -> anyhow::Result<()> {
         default_panic(info);
     }));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // Set up logging: if -v is given or RUST_LOG is set, log to a file
+    // (not stderr, which would corrupt the terminal in raw mode).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().ok();
+    let level = match (env_filter, cli.verbose) {
+        (Some(f), _) => Some(f),
+        (None, 1) => Some(tracing_subscriber::EnvFilter::new("info")),
+        (None, 2) => Some(tracing_subscriber::EnvFilter::new("debug")),
+        (None, v) if v >= 3 => Some(tracing_subscriber::EnvFilter::new("trace")),
+        _ => None,
+    };
+    if let Some(filter) = level {
+        let log_path = cli.log_file.clone().unwrap_or_else(|| {
+            let dir = dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("tether");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("tether.log").to_string_lossy().into_owned()
+        });
+        // LineWriter flushes on every newline — critical so events just
+        // before laptop sleep are persisted to disk.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("failed to open log file");
+        let writer = std::io::LineWriter::new(file);
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(writer))
+            .with_ansi(false)
+            .init();
+        info!(path = %log_path, "logging started");
+    } else {
+        // No logging requested — silently drop everything
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     if cli.host.is_none() && cli.socket.is_none() {
         // Use clap's built-in help instead of a manual message
@@ -255,6 +296,7 @@ async fn connect(
     Option<tokio::process::Child>,
 )> {
     if let Some(socket_path) = socket {
+        info!(socket = %socket_path, "connecting via unix socket");
         let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 anyhow::anyhow!("daemon not running (socket not found: {socket_path})")
@@ -267,6 +309,7 @@ async fn connect(
         let (r, w) = stream.into_split();
         Ok((Box::new(r), Box::new(w), None))
     } else if let Some(host) = host {
+        info!(host = %host, "connecting via ssh");
         let mut child = Command::new("ssh")
             .arg("-o").arg("ServerAliveInterval=5")
             .arg("-o").arg("ServerAliveCountMax=2")
@@ -276,6 +319,8 @@ async fn connect(
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
+        let pid = child.id();
+        info!(ssh_pid = ?pid, "ssh process spawned");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         Ok((Box::new(stdout), Box::new(stdin), Some(child)))
@@ -293,6 +338,7 @@ async fn handshake(
     let (cols, rows) = terminal::size()?;
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
 
+    debug!(version = PROTOCOL_VERSION, %term, cols, rows, "sending handshake");
     codec
         .write_message(
             writer,
@@ -306,7 +352,10 @@ async fn handshake(
         .await?;
 
     match read_codec.read_message(reader).await {
-        Ok(Message::HelloOk { .. }) => Ok(()),
+        Ok(Message::HelloOk { .. }) => {
+            info!("handshake ok");
+            Ok(())
+        }
         Ok(Message::Error { message, .. }) => anyhow::bail!("server error: {message}"),
         Ok(_) => anyhow::bail!("unexpected response to Hello"),
         Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
@@ -339,6 +388,7 @@ async fn run_session(
 
     let session_id = if attach_only {
         let id = name.unwrap();
+        info!(session = %id, "attaching to existing session");
         write_codec
             .write_message(
                 writer.as_mut(),
@@ -360,8 +410,12 @@ async fn run_session(
             )
             .await?;
 
+        info!("creating new session");
         let id = match read_codec.read_message(reader.as_mut()).await? {
-            Message::SessionCreated { id } => id,
+            Message::SessionCreated { id } => {
+                info!(session = %id, "session created");
+                id
+            }
             Message::Error { message, .. } => anyhow::bail!("failed to create session: {message}"),
             _ => anyhow::bail!("unexpected response"),
         };
@@ -431,16 +485,21 @@ async fn run_session(
         Ok(()) => Ok(()),
         Err(ref e) => {
             // Check if this was a connection loss (not a deliberate detach/exit)
-            let is_connection_loss = format!("{e}").contains("connection closed")
-                || format!("{e}").contains("Broken pipe")
-                || format!("{e}").contains("Connection reset");
+            let err_msg = format!("{e}");
+            let is_connection_loss = err_msg.contains("connection closed")
+                || err_msg.contains("Broken pipe")
+                || err_msg.contains("Connection reset");
             if !is_connection_loss {
+                warn!(error = %err_msg, "io_loop exited with non-connection error");
                 return result;
             }
+
+            warn!(error = %err_msg, session = %session_id, "connection lost");
 
             // Kill the old SSH process so buffered keystrokes aren't
             // delivered to the remote when the network recovers.
             if let Some(ref mut child) = _child {
+                info!("killing old ssh process");
                 let _ = child.kill().await;
             }
             drop(writer);
@@ -449,14 +508,21 @@ async fn run_session(
             // Reconnect loop with exponential backoff
             let mut delay = std::time::Duration::from_millis(100);
             let max_delay = std::time::Duration::from_secs(30);
+            let mut attempt = 0u32;
             loop {
                 {
                     let mut out = std::io::stdout();
-                    let _ = write!(out, "\r\n[connection lost, reconnecting in {}s... ctrl-c to quit]\r\n",
+                    // First message on a new line, subsequent ones overwrite in place
+                    if attempt == 0 {
+                        let _ = write!(out, "\r\n");
+                    }
+                    let _ = write!(out, "\r\x1b[2K[connection lost, reconnecting in {}s... ctrl-c to quit]",
                         delay.as_secs().max(1));
                     let _ = out.flush();
                 }
+                attempt += 1;
 
+                info!(delay_secs = delay.as_secs().max(1), "waiting before reconnect");
                 // Wait for delay, but allow user to interrupt
                 let interrupted = tokio::select! {
                     _ = tokio::time::sleep(delay) => false,
@@ -465,11 +531,13 @@ async fn run_session(
                     }
                 };
                 if interrupted {
+                    info!("user interrupted reconnect loop");
                     return Ok(());
                 }
 
                 // Reconnect attempt — interruptible via stdin, with timeout.
                 // try_reconnect doesn't borrow stdin_rx, so we can select.
+                info!(session = %session_id, "attempting reconnect");
                 let reconnect_timeout = std::time::Duration::from_secs(15);
                 let result = tokio::select! {
                     r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
@@ -487,11 +555,7 @@ async fn run_session(
                 };
                 match result {
                     Ok((reader, writer, read_codec, write_codec, _child)) => {
-                        {
-                            let mut out = std::io::stdout();
-                            let _ = write!(out, "\r\n[reconnected]\r\n");
-                            let _ = out.flush();
-                        }
+                        info!(session = %session_id, "reconnected successfully");
                         let mut reader = reader;
                         let mut writer = writer;
                         let mut read_codec = read_codec;
@@ -505,16 +569,18 @@ async fn run_session(
                         ).await;
                         match result {
                             Ok(()) => return Ok(()),
-                            Err(_) => {
+                            Err(ref e) => {
+                                warn!(error = %e, "connection lost again after reconnect");
                                 delay = std::time::Duration::from_millis(100);
                             }
                         }
                     }
                     Err(e) => {
                         let msg = format!("{e}");
+                        warn!(error = %msg, "reconnect attempt failed");
                         if msg.contains("reattach failed") {
                             let mut out = std::io::stdout();
-                            let _ = write!(out, "\r\n[session no longer exists]\r\n");
+                            let _ = write!(out, "\r\x1b[2K[session no longer exists]\r\n");
                             let _ = out.flush();
                             return Ok(());
                         }
@@ -539,7 +605,9 @@ async fn try_reconnect(
     FrameCodec,
     Option<tokio::process::Child>,
 )> {
+    debug!(session = %session_id, "try_reconnect: connecting");
     let (mut reader, mut writer, _child) = connect(host, socket).await?;
+    debug!("try_reconnect: connected, starting handshake");
     let write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
 
@@ -551,6 +619,7 @@ async fn try_reconnect(
     )
     .await?;
 
+    debug!(session = %session_id, "try_reconnect: handshake ok, attaching");
     write_codec
         .write_message(
             writer.as_mut(),
@@ -560,6 +629,7 @@ async fn try_reconnect(
 
     match read_codec.read_message(reader.as_mut()).await? {
         Message::SessionState(state) => {
+            debug!("try_reconnect: got session state snapshot");
             let mut stdout = std::io::stdout();
             execute!(
                 stdout,
@@ -614,15 +684,20 @@ async fn io_loop(
                         debug!("unexpected message: {:?}", msg.type_id());
                     }
                     Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
+                        warn!("io_loop: read returned connection closed");
                         anyhow::bail!("connection closed");
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        warn!(error = %e, "io_loop: read error");
+                        return Err(e.into());
+                    }
                 }
             }
 
             Some(data) = stdin_rx.recv() => {
                 // Ctrl-\ detaches immediately — don't wait for the write
                 if data.contains(&DETACH_BYTE) {
+                    info!(session = %session_id, "detach requested (ctrl-\\)");
                     // Best-effort send, don't block on dead connection
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(500),
@@ -638,7 +713,14 @@ async fn io_loop(
                     write_codec.write_message(writer, &Message::Data(data)),
                 ).await {
                     Ok(Ok(())) => {}
-                    _ => anyhow::bail!("connection closed"),
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "io_loop: write error");
+                        anyhow::bail!("connection closed");
+                    }
+                    Err(_) => {
+                        warn!("io_loop: write timed out after {}s", write_timeout.as_secs());
+                        anyhow::bail!("connection closed");
+                    }
                 }
             }
 
