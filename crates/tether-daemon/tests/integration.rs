@@ -1485,3 +1485,158 @@ async fn test_reattach_works_after_write_timeout() {
 
     std::fs::remove_file(&socket_path).ok();
 }
+
+/// Regression test: reattach must not hang when the PTY is actively producing
+/// output and the previous client disconnected without a clean detach.
+///
+/// Previously, the server held the registry lock across `handle.snapshot()`,
+/// which could block when the event relay task needed the same lock to drain
+/// the session event channel — causing the reattach to never complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reattach_while_pty_producing_output() {
+    let socket_path = test_socket_path("reattach-active");
+    let _daemon = start_daemon(&socket_path).await;
+
+    // Client 1: create session and attach
+    let (wc1, mut rc1, stream1) = connect_and_handshake(&socket_path).await;
+    let (mut r1, mut w1) = stream1.into_split();
+    create_and_attach(&wc1, &mut rc1, &mut r1, &mut w1, "busy").await;
+
+    // Start continuous output so event/output channels fill up
+    wc1.write_message(
+        &mut w1,
+        &Message::Data(b"while true; do printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAA\\n'; done\n".to_vec()),
+    )
+    .await
+    .unwrap();
+
+    // Let output flow and channels fill
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Abruptly drop the connection — no clean detach (simulates network loss).
+    // The server's event relay task still has output to send, and the session's
+    // PTY continues producing data.
+    drop(w1);
+    drop(r1);
+
+    // Let output accumulate with no client draining the output channel
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Client 2: reconnect and reattach
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "busy".into() })
+        .await
+        .unwrap();
+
+    // The reattach MUST complete within 5 seconds.
+    // Before the fix, this could hang indefinitely because the registry lock
+    // was held while snapshot() waited for the session inner lock.
+    let resp = timeout(Duration::from_secs(5), rc2.read_message(&mut r2))
+        .await
+        .expect("reattach timed out — possible deadlock in snapshot while holding registry lock")
+        .unwrap();
+
+    assert!(
+        matches!(resp, Message::SessionState(_)),
+        "expected SessionState on reattach, got: {resp:?}"
+    );
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// Stress test: multiple sessions reconnect simultaneously with active PTY output.
+/// Mirrors the real-world scenario where a network disconnect affects all sessions
+/// and they all race to reattach at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_reattach_with_active_output() {
+    let socket_path = test_socket_path("concurrent-reattach");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let session_names: Vec<String> = (0..4).map(|i| format!("cr-sess-{i}")).collect();
+
+    // Create all sessions via one control connection
+    {
+        let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+        let (mut r, mut w) = stream.into_split();
+
+        for name in &session_names {
+            wc.write_message(
+                &mut w,
+                &Message::SessionCreate {
+                    id: Some(name.clone()),
+                    cmd: Some("/bin/sh".into()),
+                    cols: 80,
+                    rows: 24,
+                    env: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+            let resp = rc.read_message(&mut r).await.unwrap();
+            assert!(matches!(resp, Message::SessionCreated { .. }));
+        }
+    }
+
+    // Attach to each session and start continuous output
+    let mut clients = Vec::new();
+    for name in &session_names {
+        let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+        let (mut r, mut w) = stream.into_split();
+
+        wc.write_message(&mut w, &Message::SessionAttach { id: name.clone() })
+            .await
+            .unwrap();
+        let _ = rc.read_message(&mut r).await.unwrap(); // HelloOk (first attach)
+
+        wc.write_message(
+            &mut w,
+            &Message::Data(b"while true; do printf 'BBBBBBBB\\n'; done\n".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        clients.push((wc, r, w));
+    }
+
+    // Let output flow
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Simulate network outage: drop ALL connections at once
+    drop(clients);
+
+    // Let output accumulate with all channels orphaned
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reattach all sessions concurrently — all must succeed within timeout
+    let mut handles = Vec::new();
+    for name in &session_names {
+        let path = socket_path.clone();
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            let (wc, mut rc, stream) = connect_and_handshake(&path).await;
+            let (mut r, mut w) = stream.into_split();
+
+            wc.write_message(&mut w, &Message::SessionAttach { id: name.clone() })
+                .await
+                .unwrap();
+
+            let resp = timeout(Duration::from_secs(5), rc.read_message(&mut r))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: reattach timed out — possible deadlock"))
+                .unwrap();
+
+            assert!(
+                matches!(resp, Message::SessionState(_)),
+                "{name}: expected SessionState, got: {resp:?}"
+            );
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}

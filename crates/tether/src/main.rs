@@ -47,7 +47,7 @@ struct Cli {
     socket: Option<String>,
 
     /// Enable verbose logging (-v info, -vv debug, -vvv trace).
-    /// Logs to ~/.local/share/tether/tether.log
+    /// Logs to platform data dir (macOS: ~/Library/Application Support/tether/tether.log)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 

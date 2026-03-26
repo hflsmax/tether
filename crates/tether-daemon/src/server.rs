@@ -197,8 +197,13 @@ async fn handle_connection(
                                         timed_write!(&Message::HelloOk { version: PROTOCOL_VERSION });
                                     } else {
                                         // Reattach: send snapshot to restore screen state.
-                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
+                                        // Drop registry lock BEFORE snapshot to avoid deadlock:
+                                        // snapshot() acquires session inner lock, but the PTY
+                                        // reader holds inner lock while sending to the event
+                                        // channel, and the event relay needs the registry lock
+                                        // to drain that channel.
                                         drop(reg);
+                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
                                         timed_write!(&Message::SessionState(snapshot));
                                     }
 
