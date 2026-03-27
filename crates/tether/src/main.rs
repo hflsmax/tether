@@ -679,6 +679,10 @@ async fn io_loop(
                         info!(session = %id, exit_code, "session exited");
                         return Ok(());
                     }
+                    Ok(Message::Ping { seq }) => {
+                        // Reply to daemon keepalive
+                        let _ = write_codec.write_message(writer, &Message::Pong { seq }).await;
+                    }
                     Ok(Message::Pong { .. }) => {}
                     Ok(msg) => {
                         debug!("unexpected message: {:?}", msg.type_id());

@@ -9,13 +9,16 @@ use tether_protocol::{FrameCodec, Message, PROTOCOL_VERSION};
 // -- Helpers --
 
 async fn start_daemon(socket_path: &str) -> tokio::task::JoinHandle<()> {
-    let config = tether_daemon::Config {
+    start_daemon_with_config(socket_path, tether_daemon::Config {
         socket_path: socket_path.to_string(),
         idle_timeout: "60s".into(),
         max_sessions: 5,
         ..Default::default()
-    };
+    }).await
+}
 
+async fn start_daemon_with_config(socket_path: &str, mut config: tether_daemon::Config) -> tokio::task::JoinHandle<()> {
+    config.socket_path = socket_path.to_string();
     let server = tether_daemon::Server::new(config);
     tokio::spawn(async move {
         server.run().await.unwrap();
@@ -1636,6 +1639,78 @@ async fn test_concurrent_reattach_with_active_output() {
 
     for h in handles {
         h.await.unwrap();
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// Keepalive detects dead connections on idle sessions.
+///
+/// When a session produces no output (e.g. an idle MCP server), the only way
+/// to detect a dead client is via keepalive pings. Without keepalive, the
+/// session stays "attached" forever because the daemon never tries to write.
+///
+/// This test attaches to an idle session, stops reading (simulating a dead SSH
+/// tunnel where the proxy holds the Unix socket open), and verifies the daemon
+/// detects the dead connection via keepalive and marks the session as detached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_keepalive_detaches_idle_session() {
+    let socket_path = test_socket_path("keepalive-idle");
+    let _daemon = start_daemon_with_config(&socket_path, tether_daemon::Config {
+        idle_timeout: "60s".into(),
+        max_sessions: 5,
+        keepalive: "1s".into(),
+        ..Default::default()
+    }).await;
+
+    // Create and attach to a session
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "idle-ka").await;
+
+    // Verify it's attached
+    wc.write_message(&mut w, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut rc, &mut r).await;
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            let s = sessions.iter().find(|s| s.id == "idle-ka").unwrap();
+            assert!(s.attached, "session should be attached initially");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    // Simulate dead SSH tunnel: stop reading from the socket but keep
+    // the write half alive so the Unix socket isn't fully closed.
+    // This prevents the read-side ConnectionClosed path from firing —
+    // the ONLY way the daemon can detect the dead client is via the
+    // keepalive Ping/Pong mechanism.
+    //
+    // Don't generate any PTY output — the session stays completely idle.
+
+    // Wait for: first keepalive tick sends Ping (1s), client doesn't
+    // reply with Pong (not reading), second tick sees missing Pong and
+    // disconnects (another 1s), plus margin.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Drop old connection
+    drop(r);
+    drop(w);
+
+    // New connection: verify session was detached by keepalive
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionList).await.unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1, "session should still exist");
+            assert!(
+                !sessions[0].attached,
+                "session should be detached after keepalive timeout"
+            );
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
     }
 
     std::fs::remove_file(&socket_path).ok();

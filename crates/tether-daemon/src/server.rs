@@ -135,6 +135,19 @@ async fn handle_connection(
         };
     }
 
+    // Keepalive: detect dead connections even when no PTY output flows.
+    // Without this, a dead SSH tunnel leaves sessions "attached" forever
+    // because the Unix socket stays open and there's nothing to write.
+    //
+    // How it works: every interval, send a Ping. If no Pong comes back
+    // before the next tick, the client is dead — bail out and detach.
+    // (We can't rely on write timeout alone because Ping messages are tiny
+    // and the Unix socket buffer can absorb hundreds of them.)
+    let mut keepalive = tokio::time::interval(config.keepalive_duration());
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ping_seq: u32 = 0;
+    let mut awaiting_pong: bool = false;
+
     // Run the main loop inside an async block so that `?` and `return` exit
     // the block — not the function — letting us always detach below.
     let result: anyhow::Result<()> = async {
@@ -307,6 +320,10 @@ async fn handle_connection(
                             timed_write!(&Message::Pong { seq });
                         }
 
+                        Message::Pong { .. } => {
+                            awaiting_pong = false;
+                        }
+
                         _ => {
                             debug!("unexpected message type: 0x{:02x}", msg.type_id());
                         }
@@ -333,6 +350,20 @@ async fn handle_connection(
                                 );
                             }
                         }
+                    }
+                }
+
+                // Keepalive: send Ping and expect Pong back before next tick.
+                _ = keepalive.tick() => {
+                    if attached.is_some() {
+                        if awaiting_pong {
+                            // Previous Ping never got a Pong — client is dead.
+                            info!("keepalive timeout — no Pong received");
+                            anyhow::bail!("keepalive timeout");
+                        }
+                        ping_seq = ping_seq.wrapping_add(1);
+                        timed_write!(&Message::Ping { seq: ping_seq });
+                        awaiting_pong = true;
                     }
                 }
             }

@@ -16,12 +16,15 @@ pub struct Config {
     pub raw_log_size: usize,
     #[serde(default = "default_default_shell")]
     pub default_shell: String,
+    #[serde(default = "default_keepalive")]
+    pub keepalive: String,
 }
 
 fn default_idle_timeout() -> String { "24h".into() }
 fn default_scrollback_lines() -> usize { 10_000 }
 fn default_max_sessions() -> usize { 20 }
 fn default_raw_log_size() -> usize { 1024 * 1024 } // 1 MiB
+fn default_keepalive() -> String { "30s".into() }
 fn default_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
@@ -35,6 +38,7 @@ impl Default for Config {
             socket_path: String::new(),
             raw_log_size: default_raw_log_size(),
             default_shell: default_default_shell(),
+            keepalive: default_keepalive(),
         }
     }
 }
@@ -48,6 +52,10 @@ impl Config {
         } else {
             PathBuf::from(&self.socket_path)
         }
+    }
+
+    pub fn keepalive_duration(&self) -> Duration {
+        parse_duration(&self.keepalive).unwrap_or(Duration::from_secs(30))
     }
 
     pub fn idle_timeout_duration(&self) -> Duration {
