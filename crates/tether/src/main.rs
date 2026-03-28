@@ -139,7 +139,7 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
     let kill_session = |id: &str, host: &Option<String>, socket: &Option<String>| -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let (mut r, mut w, _) = connect(host, socket).await?;
+                let (mut r, mut w, _) = connect(host, socket, false).await?;
                 let wc = FrameCodec::new();
                 let mut rc = FrameCodec::new();
                 handshake(&wc, &mut rc, w.as_mut(), r.as_mut()).await?;
@@ -253,7 +253,7 @@ async fn auto_connect(
     host: &Option<String>,
     socket: &Option<String>,
 ) -> anyhow::Result<()> {
-    let (mut reader, mut writer, _child) = connect(host, socket).await?;
+    let (mut reader, mut writer, _child) = connect(host, socket, false).await?;
     let write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
 
@@ -290,6 +290,7 @@ async fn auto_connect(
 async fn connect(
     host: &Option<String>,
     socket: &Option<String>,
+    reconnecting: bool,
 ) -> anyhow::Result<(
     Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -310,14 +311,20 @@ async fn connect(
         Ok((Box::new(r), Box::new(w), None))
     } else if let Some(host) = host {
         info!(host = %host, "connecting via ssh");
-        let mut child = Command::new("ssh")
-            .arg("-o").arg("ServerAliveInterval=5")
-            .arg("-o").arg("ServerAliveCountMax=2")
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o").arg("ServerAliveInterval=5")
+            .arg("-o").arg("ServerAliveCountMax=2");
+        if reconnecting {
+            // Single attempt with a tight timeout to avoid rapid-fire SSH errors
+            cmd.arg("-o").arg("ConnectTimeout=5")
+                .arg("-o").arg("ConnectionAttempts=1");
+        }
+        let mut child = cmd
             .arg(host)
             .arg("tether-proxy")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if reconnecting { Stdio::null() } else { Stdio::inherit() })
             .spawn()?;
         let pid = child.id();
         info!(ssh_pid = ?pid, "ssh process spawned");
@@ -372,7 +379,7 @@ async fn run_session(
     cmd: Option<String>,
     attach_only: bool,
 ) -> anyhow::Result<()> {
-    let (mut reader, mut writer, mut _child) = connect(host, socket).await?;
+    let (mut reader, mut writer, mut _child) = connect(host, socket, false).await?;
     let write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
 
@@ -505,40 +512,49 @@ async fn run_session(
             drop(writer);
             drop(reader);
 
-            // Reconnect loop with exponential backoff
-            let mut delay = std::time::Duration::from_millis(100);
-            let max_delay = std::time::Duration::from_secs(30);
+            // Reconnect loop with exponential backoff.
+            // Schedule: 1s, 2s, 4s, 8s, 15s, 15s, 15s, ...
+            let mut delay_secs: u64 = 1;
+            let max_delay_secs: u64 = 15;
             let mut attempt = 0u32;
+
+            {
+                let mut out = std::io::stdout();
+                let _ = write!(out, "\r\n");
+                let _ = out.flush();
+            }
+
             loop {
-                {
-                    let mut out = std::io::stdout();
-                    // First message on a new line, subsequent ones overwrite in place
-                    if attempt == 0 {
-                        let _ = write!(out, "\r\n");
-                    }
-                    let _ = write!(out, "\r\x1b[2K[connection lost, reconnecting in {}s... ctrl-c to quit]",
-                        delay.as_secs().max(1));
-                    let _ = out.flush();
-                }
                 attempt += 1;
 
-                info!(delay_secs = delay.as_secs().max(1), "waiting before reconnect");
-                // Wait for delay, but allow user to interrupt
-                let interrupted = tokio::select! {
-                    _ = tokio::time::sleep(delay) => false,
-                    Some(data) = stdin_rx.recv() => {
-                        data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04)
+                // Ticking countdown so the user sees progress
+                for remaining in (1..=delay_secs).rev() {
+                    {
+                        let mut out = std::io::stdout();
+                        let _ = write!(out, "\r\x1b[2K[connection lost, retrying in {remaining}s... ctrl-c to quit]");
+                        let _ = out.flush();
                     }
-                };
-                if interrupted {
-                    info!("user interrupted reconnect loop");
-                    return Ok(());
+                    let interrupted = tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => false,
+                        Some(data) = stdin_rx.recv() => {
+                            data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04)
+                        }
+                    };
+                    if interrupted {
+                        info!("user interrupted reconnect loop");
+                        return Ok(());
+                    }
+                }
+
+                {
+                    let mut out = std::io::stdout();
+                    let _ = write!(out, "\r\x1b[2K[reconnecting... attempt {attempt}]");
+                    let _ = out.flush();
                 }
 
                 // Reconnect attempt — interruptible via stdin, with timeout.
-                // try_reconnect doesn't borrow stdin_rx, so we can select.
-                info!(session = %session_id, "attempting reconnect");
-                let reconnect_timeout = std::time::Duration::from_secs(15);
+                info!(session = %session_id, attempt, "attempting reconnect");
+                let reconnect_timeout = std::time::Duration::from_secs(10);
                 let result = tokio::select! {
                     r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
                         match r {
@@ -571,7 +587,8 @@ async fn run_session(
                             Ok(()) => return Ok(()),
                             Err(ref e) => {
                                 warn!(error = %e, "connection lost again after reconnect");
-                                delay = std::time::Duration::from_millis(100);
+                                delay_secs = 1;
+                                attempt = 0;
                             }
                         }
                     }
@@ -584,7 +601,7 @@ async fn run_session(
                             let _ = out.flush();
                             return Ok(());
                         }
-                        delay = (delay * 2).min(max_delay);
+                        delay_secs = (delay_secs * 2).min(max_delay_secs);
                     }
                 }
             }
@@ -606,7 +623,7 @@ async fn try_reconnect(
     Option<tokio::process::Child>,
 )> {
     debug!(session = %session_id, "try_reconnect: connecting");
-    let (mut reader, mut writer, _child) = connect(host, socket).await?;
+    let (mut reader, mut writer, _child) = connect(host, socket, true).await?;
     debug!("try_reconnect: connected, starting handshake");
     let write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
