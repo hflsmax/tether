@@ -77,6 +77,17 @@ curl -fsSL https://raw.githubusercontent.com/hflsmax/tether/main/dist/install.sh
 sudo systemctl enable --now tetherd@$USER
 ```
 
+#### Per-user install (no root)
+
+If you don't have root access, install as a systemd user service. Requires `loginctl enable-linger` (ask an admin to run it once):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hflsmax/tether/main/dist/install.sh | bash -s -- --user
+systemctl --user enable --now tetherd
+```
+
+Binaries go to `~/.local/bin` and the service to `~/.config/systemd/user/`. The script will tell you how to add `~/.local/bin` to your PATH if it isn't already.
+
 ### Server (NixOS)
 
 Add tether to your flake inputs and import the module:
@@ -125,6 +136,8 @@ sudo curl -fSL https://raw.githubusercontent.com/hflsmax/tether/main/dist/tether
 sudo systemctl daemon-reload
 sudo systemctl enable --now tetherd@$USER
 ```
+
+Without root, use the [per-user install](#per-user-install-no-root) instead.
 
 Or run manually:
 

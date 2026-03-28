@@ -355,9 +355,9 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "libc",
 ]
@@ -406,9 +406,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mio"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
+checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
  "log",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "tether"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "tether-daemon"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "nix",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "tether-protocol"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bincode",
  "bitflags",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "tether-proxy"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "nix",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "tether-session"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "alacritty_terminal",
  "bytes",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "tetherd"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",

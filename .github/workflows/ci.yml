@@ -16,6 +16,53 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  test-user-install:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Stage release artifacts
+        run: |
+          mkdir -p /tmp/release
+          TARGET=x86_64-unknown-linux-gnu
+          cp target/$TARGET/release/tetherd /tmp/release/tetherd-$TARGET
+          cp target/$TARGET/release/tether-proxy /tmp/release/tether-proxy-$TARGET
+          cp dist/tetherd.user.service /tmp/release/
+      - name: Run install script (--user)
+        run: |
+          RELEASE_URL="file:///tmp/release" bash dist/install.sh --user
+      - name: Verify binaries installed
+        run: |
+          test -x "$HOME/.local/bin/tetherd"
+          test -x "$HOME/.local/bin/tether-proxy"
+          "$HOME/.local/bin/tetherd" --version
+          "$HOME/.local/bin/tether-proxy" --version
+      - name: Verify service file installed and patched
+        run: |
+          UNIT="$HOME/.config/systemd/user/tetherd.service"
+          test -f "$UNIT"
+          grep -q "$HOME/.local/bin/tetherd" "$UNIT"
+      - name: Start tetherd as user service
+        run: |
+          systemctl --user start tetherd
+          sleep 1
+          systemctl --user is-active tetherd
+      - name: Verify socket exists
+        run: test -S "$XDG_RUNTIME_DIR/tether.sock"
+      - name: Test PATH warning output
+        run: |
+          # Remove ~/.local/bin from PATH to trigger the warning
+          export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "$HOME/.local/bin" | tr '\n' ':')
+          RELEASE_URL="file:///tmp/release" bash dist/install.sh --user 2>&1 | grep -q "WARNING.*not in your PATH"
+      - name: Verify service is healthy after test
+        run: systemctl --user is-active tetherd
+      - name: Stop tetherd
+        if: always()
+        run: systemctl --user stop tetherd || true
+
   test-deb:
     runs-on: ubuntu-latest
     needs: test
