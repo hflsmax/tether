@@ -37,7 +37,11 @@ impl Drop for RawModeGuard {
 
 /// Persistent terminal sessions over SSH
 #[derive(Parser)]
-#[command(name = "tether", version, override_usage = "tether <user@host>\n       tether --socket <path>")]
+#[command(
+    name = "tether",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), " ", env!("GIT_COMMIT_DATE"), ")"),
+    override_usage = "tether <user@host>\n       tether --socket <path>",
+)]
 struct Cli {
     /// Remote host (user@host)
     host: Option<String>,

@@ -12,7 +12,7 @@ use tracing::debug;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("tether-proxy {}", env!("CARGO_PKG_VERSION"));
+        println!("tether-proxy {} ({} {})", env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT_HASH"), env!("GIT_COMMIT_DATE"));
         return Ok(());
     }
 
