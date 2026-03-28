@@ -163,11 +163,6 @@ async fn handle_connection(
                         Err(e) => return Err(e.into()),
                     };
 
-                    // Any incoming message proves the client is alive.
-                    // This ensures old clients (pre-Pong) aren't disconnected
-                    // as long as they're actively sending data/resize/etc.
-                    awaiting_pong = false;
-
                     match msg {
                         Message::SessionCreate { id, cmd, cols, rows, env } => {
                             let env_vec: Vec<(String, String)> = env.into_iter().collect();
@@ -325,7 +320,9 @@ async fn handle_connection(
                             timed_write!(&Message::Pong { seq });
                         }
 
-                        Message::Pong { .. } => {}
+                        Message::Pong { .. } => {
+                            awaiting_pong = false;
+                        }
 
                         _ => {
                             debug!("unexpected message type: 0x{:02x}", msg.type_id());

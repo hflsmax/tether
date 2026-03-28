@@ -1681,15 +1681,12 @@ async fn test_keepalive_detaches_idle_session() {
 
     // Simulate dead SSH tunnel: stop reading from the socket but keep
     // the write half alive so the Unix socket isn't fully closed.
-    // This prevents the read-side ConnectionClosed path from firing —
-    // the ONLY way the daemon can detect the dead client is via the
-    // keepalive Ping/Pong mechanism.
-    //
-    // Don't generate any PTY output — the session stays completely idle.
+    // This prevents the read-side ConnectionClosed path from firing.
+    // The client sends no Pong (not reading), so the daemon's keepalive
+    // detects the dead connection after two ticks.
 
-    // Wait for: first keepalive tick sends Ping (1s), client doesn't
-    // reply with Pong (not reading), second tick sees missing Pong and
-    // disconnects (another 1s), plus margin.
+    // Wait for: first keepalive tick sends Ping (1s), second tick sees
+    // no Pong and disconnects (another 1s), plus margin.
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Drop old connection
