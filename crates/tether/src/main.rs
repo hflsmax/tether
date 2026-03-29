@@ -179,14 +179,10 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
             let idle = format_duration(s.idle_secs);
             let cwd = shorten_path(&s.cwd);
 
-            if s.attached {
-                write!(out, "\x1b[2m  {:<18} {:<12} {:<24} {:<8} {} (attached)\x1b[0m\r\n",
-                    s.id, proc_name, cwd, age, idle)?;
-            } else {
-                if sel == idx { write!(out, "\x1b[7m")?; }
-                write!(out, "{} {:<18} {:<12} {:<24} {:<8} {}\x1b[0m\r\n",
-                    if sel == idx { ">" } else { " " }, s.id, proc_name, cwd, age, idle)?;
-            }
+            if sel == idx { write!(out, "\x1b[7m")?; }
+            let suffix = if s.attached { " (attached)" } else { "" };
+            write!(out, "{} {:<18} {:<12} {:<24} {:<8} {}{}\x1b[0m\r\n",
+                if sel == idx { ">" } else { " " }, s.id, proc_name, cwd, age, idle, suffix)?;
         }
 
         write!(out, "\r\n")?;
@@ -200,24 +196,13 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
 
         if let Event::Key(ev @ KeyEvent { kind: KeyEventKind::Press, .. }) = event::read()? {
             let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
-            let is_selectable = |idx: usize| -> bool {
-                idx == 0 || !sessions[idx - 1].attached
-            };
 
             match ev.code {
                 KeyCode::Up | KeyCode::Char('k') if !ctrl => {
-                    let mut next = sel as i32 - 1;
-                    while next >= 0 {
-                        if is_selectable(next as usize) { sel = next as usize; break; }
-                        next -= 1;
-                    }
+                    sel = sel.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') if !ctrl => {
-                    let mut next = sel + 1;
-                    while next < total {
-                        if is_selectable(next) { sel = next; break; }
-                        next += 1;
-                    }
+                    if sel + 1 < total { sel += 1; }
                 }
                 KeyCode::Enter => {
                     leave(&mut out)?;
@@ -226,15 +211,12 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
                     }
                     return Ok(PickerAction::Resume(sessions[sel - 1].id.clone()));
                 }
-                KeyCode::Char('x') if !ctrl && sel > 0 && is_selectable(sel) => {
+                KeyCode::Char('x') if !ctrl && sel > 0 && !sessions[sel - 1].attached => {
                     let id = sessions[sel - 1].id.clone();
                     kill_session(&id, host, socket)?;
                     sessions.remove(sel - 1);
                     if sel > sessions.len() {
                         sel = sessions.len();
-                    }
-                    while sel > 0 && sel <= sessions.len() && sessions[sel - 1].attached {
-                        sel -= 1;
                     }
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
@@ -272,12 +254,10 @@ async fn auto_connect(
         _ => vec![],
     };
 
-    let has_detached = sessions.iter().any(|s| !s.attached);
-
     drop(reader);
     drop(writer);
 
-    if sessions.is_empty() || !has_detached {
+    if sessions.is_empty() {
         return run_session(host, socket, None, None, false).await;
     }
 
@@ -538,10 +518,17 @@ async fn run_session(
                         let _ = write!(out, "\r\x1b[2K[connection lost, retrying in {remaining}s... ctrl-c to quit]");
                         let _ = out.flush();
                     }
-                    let interrupted = tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => false,
-                        Some(data) = stdin_rx.recv() => {
-                            data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04)
+                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
+                    tokio::pin!(sleep);
+                    let interrupted = loop {
+                        tokio::select! {
+                            _ = &mut sleep => break false,
+                            Some(data) = stdin_rx.recv() => {
+                                if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                                    break true;
+                                }
+                                // Non-interrupt keypress — ignore and keep waiting
+                            }
                         }
                     };
                     if interrupted {

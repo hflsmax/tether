@@ -320,7 +320,8 @@ async fn handle_connection(
                             timed_write!(&Message::Pong { seq });
                         }
 
-                        Message::Pong { .. } => {
+                        Message::Pong { seq } => {
+                            debug!(seq, "received Pong");
                             awaiting_pong = false;
                         }
 
@@ -362,6 +363,7 @@ async fn handle_connection(
                             anyhow::bail!("keepalive timeout");
                         }
                         ping_seq = ping_seq.wrapping_add(1);
+                        debug!(seq = ping_seq, "sending Ping");
                         timed_write!(&Message::Ping { seq: ping_seq });
                         awaiting_pong = true;
                     }

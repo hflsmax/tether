@@ -1,8 +1,9 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// tether-proxy: stdin/stdout ↔ Unix socket bridge.
 ///
@@ -42,11 +43,26 @@ async fn main() -> anyhow::Result<()> {
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
 
+    // Stdin activity timeout: the daemon sends keepalive Pings (default every 30s)
+    // and the client responds with Pongs via SSH → stdin. If stdin is silent for
+    // this long, the SSH connection is dead.
+    let stdin_timeout_secs: u64 = std::env::var("TETHER_PROXY_STDIN_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    let stdin_timeout = Duration::from_secs(stdin_timeout_secs);
+
     // Bidirectional copy: stdin → socket, socket → stdout
     let stdin_to_sock = async {
         let mut buf = vec![0u8; 8192];
         loop {
-            let n = stdin.read(&mut buf).await?;
+            let n = match tokio::time::timeout(stdin_timeout, stdin.read(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!("stdin silent for {stdin_timeout_secs}s, exiting");
+                    break;
+                }
+            };
             if n == 0 {
                 break;
             }

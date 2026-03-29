@@ -1712,3 +1712,160 @@ async fn test_keepalive_detaches_idle_session() {
 
     std::fs::remove_file(&socket_path).ok();
 }
+
+/// When a session is currently attached by client 1 (simulating a dead
+/// connection), client 2 should be able to "steal" the session by sending
+/// SessionAttach. The daemon kicks the old client and hands the session
+/// to the new one.
+#[tokio::test]
+async fn test_reattach_steals_from_stale_attached_client() {
+    let socket_path = test_socket_path("steal-attach");
+    let _daemon = start_daemon(&socket_path).await;
+
+    // Client 1: create and attach
+    let (wc1, mut rc1, stream1) = connect_and_handshake(&socket_path).await;
+    let (mut r1, mut w1) = stream1.into_split();
+    create_and_attach(&wc1, &mut rc1, &mut r1, &mut w1, "steal-me").await;
+
+    // Verify session is attached
+    wc1.write_message(&mut w1, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut rc1, &mut r1).await;
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert!(sessions[0].attached, "session should be attached by client 1");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    // Client 2: connect and attach to the same session (stealing it)
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "steal-me".into() })
+        .await
+        .unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)), "client 2 should get session snapshot");
+
+    // Client 2 should be fully functional
+    send_and_expect(&wc2, &mut rc2, &mut r2, &mut w2, "echo stolen-ok\n", "stolen-ok").await;
+
+    // Verify session is still attached (now by client 2)
+    wc2.write_message(&mut w2, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut rc2, &mut r2).await;
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert!(sessions[0].attached, "session should be attached by client 2");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// After a client steals a session from a stale connection, the old
+/// connection handler should clean up. Verify the session can be
+/// detached and reattached again after the steal.
+#[tokio::test]
+async fn test_session_survives_multiple_steals() {
+    let socket_path = test_socket_path("multi-steal");
+    let _daemon = start_daemon(&socket_path).await;
+
+    // Client 1: create and attach
+    let (wc1, mut rc1, stream1) = connect_and_handshake(&socket_path).await;
+    let (mut r1, mut w1) = stream1.into_split();
+    create_and_attach(&wc1, &mut rc1, &mut r1, &mut w1, "resilient").await;
+
+    // Client 2 steals
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "resilient".into() })
+        .await.unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)));
+
+    // Client 3 steals from client 2
+    let (wc3, mut rc3, stream3) = connect_and_handshake(&socket_path).await;
+    let (mut r3, mut w3) = stream3.into_split();
+    wc3.write_message(&mut w3, &Message::SessionAttach { id: "resilient".into() })
+        .await.unwrap();
+    let resp = rc3.read_message(&mut r3).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)));
+
+    // Session should still be functional after two steals
+    send_and_expect(&wc3, &mut rc3, &mut r3, &mut w3, "echo triple-ok\n", "triple-ok").await;
+
+    // Detach client 3, verify session is detached
+    wc3.write_message(&mut w3, &Message::SessionDetach).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Use a fresh connection to check detach state (no PTY output interleaving)
+    let (wc_check, mut rc_check, stream_check) = connect_and_handshake(&socket_path).await;
+    let (mut r_check, mut w_check) = stream_check.into_split();
+    wc_check.write_message(&mut w_check, &Message::SessionList).await.unwrap();
+    let resp = rc_check.read_message(&mut r_check).await.unwrap();
+    match &resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert!(!sessions[0].attached, "session should be detached after explicit detach");
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    // Client 4 reattaches normally
+    let (wc4, mut rc4, stream4) = connect_and_handshake(&socket_path).await;
+    let (mut r4, mut w4) = stream4.into_split();
+    wc4.write_message(&mut w4, &Message::SessionAttach { id: "resilient".into() })
+        .await.unwrap();
+    let resp = rc4.read_message(&mut r4).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)));
+    send_and_expect(&wc4, &mut rc4, &mut r4, &mut w4, "echo fourth-ok\n", "fourth-ok").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// When client 2 steals a session, client 1's output channel is closed.
+/// Client 1 should receive a SessionExited (the channel EOF path) and
+/// NOT prevent the session from continuing.
+#[tokio::test]
+async fn test_steal_notifies_old_client() {
+    let socket_path = test_socket_path("steal-notify");
+    let _daemon = start_daemon(&socket_path).await;
+
+    // Client 1: create and attach
+    let (wc1, mut rc1, stream1) = connect_and_handshake(&socket_path).await;
+    let (mut r1, mut w1) = stream1.into_split();
+    create_and_attach(&wc1, &mut rc1, &mut r1, &mut w1, "notify-test").await;
+
+    // Client 2: steal the session
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+    wc2.write_message(&mut w2, &Message::SessionAttach { id: "notify-test".into() })
+        .await.unwrap();
+    let resp = rc2.read_message(&mut r2).await.unwrap();
+    assert!(matches!(resp, Message::SessionState(_)));
+
+    // Client 1 should get a SessionExited (from the output channel closing)
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = rc1.read_message(&mut r1).await.unwrap();
+            if !matches!(msg, Message::Data(_) | Message::Ping { .. }) {
+                return msg;
+            }
+            // Reply to pings to keep the connection alive while waiting
+            if let Message::Ping { seq } = msg {
+                wc1.write_message(&mut w1, &Message::Pong { seq }).await.unwrap();
+            }
+        }
+    }).await.expect("client 1 should receive notification after being kicked");
+
+    assert!(matches!(msg, Message::SessionExited { .. }),
+        "expected SessionExited, got: {msg:?}");
+
+    // Client 2 should still work
+    send_and_expect(&wc2, &mut rc2, &mut r2, &mut w2, "echo still-ok\n", "still-ok").await;
+
+    std::fs::remove_file(&socket_path).ok();
+}
