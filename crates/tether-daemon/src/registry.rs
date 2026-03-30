@@ -91,10 +91,8 @@ impl Registry {
     ) -> Result<(mpsc::Receiver<Vec<u8>>, Option<mpsc::Receiver<SessionEvent>>), String> {
         let entry = self.sessions.get_mut(id).ok_or_else(|| format!("session '{id}' not found"))?;
 
-        // Detach previous client if any
         if entry.output_tx.is_some() {
-            debug!(session = %id, "detaching previous client");
-            entry.output_tx = None;
+            return Err(format!("session '{id}' is already attached"));
         }
 
         let (tx, rx) = mpsc::channel(256);

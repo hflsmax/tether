@@ -179,10 +179,15 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
             let idle = format_duration(s.idle_secs);
             let cwd = shorten_path(&s.cwd);
 
-            if sel == idx { write!(out, "\x1b[7m")?; }
+            if s.attached {
+                // Dim attached sessions
+                write!(out, "\x1b[2m")?;
+            } else if sel == idx {
+                write!(out, "\x1b[7m")?;
+            }
             let suffix = if s.attached { " (attached)" } else { "" };
             write!(out, "{} {:<18} {:<12} {:<24} {:<8} {}{}\x1b[0m\r\n",
-                if sel == idx { ">" } else { " " }, s.id, proc_name, cwd, age, idle, suffix)?;
+                if sel == idx && !s.attached { ">" } else { " " }, s.id, proc_name, cwd, age, idle, suffix)?;
         }
 
         write!(out, "\r\n")?;
@@ -197,18 +202,33 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
         if let Event::Key(ev @ KeyEvent { kind: KeyEventKind::Press, .. }) = event::read()? {
             let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
 
+            let is_selectable = |idx: usize| -> bool {
+                idx == 0 || !sessions[idx - 1].attached
+            };
+
             match ev.code {
                 KeyCode::Up | KeyCode::Char('k') if !ctrl => {
-                    sel = sel.saturating_sub(1);
+                    let mut next = sel;
+                    while next > 0 {
+                        next -= 1;
+                        if is_selectable(next) { break; }
+                    }
+                    if is_selectable(next) { sel = next; }
                 }
                 KeyCode::Down | KeyCode::Char('j') if !ctrl => {
-                    if sel + 1 < total { sel += 1; }
+                    let mut next = sel;
+                    while next + 1 < total {
+                        next += 1;
+                        if is_selectable(next) { break; }
+                    }
+                    if is_selectable(next) { sel = next; }
                 }
                 KeyCode::Enter => {
-                    leave(&mut out)?;
                     if sel == 0 {
+                        leave(&mut out)?;
                         return Ok(PickerAction::New);
                     }
+                    leave(&mut out)?;
                     return Ok(PickerAction::Resume(sessions[sel - 1].id.clone()));
                 }
                 KeyCode::Char('x') if !ctrl && sel > 0 && !sessions[sel - 1].attached => {
