@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
+
+use serde::{Deserialize, Serialize};
 
 // -- Message type IDs --
 
@@ -231,7 +233,11 @@ impl Message {
                 bincode::serialize(sessions).map_err(EncodeError::Bincode)?
             }
             Message::SessionState(state) => {
-                bincode::serialize(state).map_err(EncodeError::Bincode)?
+                let raw = bincode::serialize(state).map_err(EncodeError::Bincode)?;
+                let mut encoder =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(&raw).map_err(EncodeError::Io)?;
+                encoder.finish().map_err(EncodeError::Io)?
             }
             Message::Resize { cols, rows } => {
                 bincode::serialize(&(cols, rows)).map_err(EncodeError::Bincode)?
@@ -304,7 +310,10 @@ fn decode_typed(type_id: u8, payload: &[u8]) -> Result<Message, DecodeError> {
             Ok(Message::SessionListResp { sessions })
         }
         MSG_SESSION_STATE => {
-            let state = bincode::deserialize(payload)?;
+            let mut decoder = flate2::read::DeflateDecoder::new(payload);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).map_err(DecodeError::Io)?;
+            let state = bincode::deserialize(&decompressed)?;
             Ok(Message::SessionState(state))
         }
         MSG_DATA => Ok(Message::Data(payload.to_vec())),
@@ -332,6 +341,8 @@ fn decode_typed(type_id: u8, payload: &[u8]) -> Result<Message, DecodeError> {
 pub enum EncodeError {
     #[error("bincode encode error: {0}")]
     Bincode(bincode::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -342,6 +353,8 @@ pub enum DecodeError {
     UnknownType(u8),
     #[error("bincode decode error: {0}")]
     Bincode(#[from] bincode::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[cfg(test)]

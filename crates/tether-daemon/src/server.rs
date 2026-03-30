@@ -216,8 +216,13 @@ async fn handle_connection(
                                         // channel, and the event relay needs the registry lock
                                         // to drain that channel.
                                         drop(reg);
-                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
-                                        timed_write!(&Message::SessionState(snapshot));
+                                        send_snapshot(
+                                            &write_codec,
+                                            &mut writer,
+                                            write_timeout,
+                                            &handle,
+                                            config.scrollback_lines,
+                                        ).await?;
                                     }
 
                                     let reattach = !first_attach;
@@ -382,4 +387,40 @@ async fn handle_connection(
     }
 
     result
+}
+
+/// Try to send a reattach snapshot, progressively truncating scrollback if the
+/// encoded frame exceeds MAX_FRAME_SIZE. This prevents a large scrollback from
+/// silently killing the connection.
+async fn send_snapshot(
+    codec: &FrameCodec,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    write_timeout: Duration,
+    handle: &std::sync::Arc<SessionHandle>,
+    max_scrollback: usize,
+) -> anyhow::Result<()> {
+    let mut scrollback_limit = max_scrollback;
+    loop {
+        let snapshot = handle.snapshot(scrollback_limit).await;
+        let msg = Message::SessionState(snapshot);
+        match tokio::time::timeout(write_timeout, codec.write_message(writer, &msg)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(tether_protocol::codec::CodecError::FrameTooLarge(size))) => {
+                if scrollback_limit == 0 {
+                    warn!(encoded_bytes = size, "snapshot exceeds frame limit even without scrollback");
+                    return Err(anyhow::anyhow!("snapshot too large to send ({size} bytes)"));
+                }
+                let prev = scrollback_limit;
+                scrollback_limit /= 2;
+                warn!(
+                    prev_limit = prev,
+                    new_limit = scrollback_limit,
+                    encoded_bytes = size,
+                    "snapshot too large, reducing scrollback"
+                );
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("write timeout"),
+        }
+    }
 }

@@ -10,3 +10,4 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 bitflags = { version = "2", features = ["serde"] }
+flate2 = "1"
