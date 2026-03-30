@@ -54,8 +54,11 @@ jobs:
         run: test -S "$XDG_RUNTIME_DIR/tether.sock"
       - name: Test PATH warning output
         run: |
-          # Run with a PATH that definitely doesn't contain INSTALL_DIR
-          PATH=/usr/bin:/bin RELEASE_URL="file:///tmp/release" bash dist/install.sh --user 2>&1 | grep -q "WARNING.*not in your PATH"
+          # Re-run install with a PATH that doesn't contain INSTALL_DIR.
+          # Capture output so failures are visible in CI logs.
+          output=$(PATH=/usr/bin:/bin RELEASE_URL="file:///tmp/release" bash dist/install.sh --user 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "WARNING.*not in your PATH"
       - name: Verify service is healthy after test
         run: systemctl --user is-active tetherd
       - name: Stop tetherd
