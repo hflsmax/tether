@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use tracing::{debug, info, warn};
 
-use tether_protocol::{FrameCodec, Message, PROTOCOL_VERSION};
+use tether_protocol::{FrameCodec, Message, SessionState, PROTOCOL_VERSION};
 use tether_session::{SessionEvent, SessionHandle};
 
 use crate::config::Config;
@@ -189,7 +189,7 @@ async fn handle_connection(
 
                             let mut reg = registry.lock().await;
                             match reg.attach(&id) {
-                                Ok((rx, event_rx_opt)) => {
+                                Ok((mut rx, event_rx_opt)) => {
                                     let handle = match reg.take_handle(&id) {
                                         Some(h) => h,
                                         None => {
@@ -210,19 +210,33 @@ async fn handle_connection(
                                         timed_write!(&Message::HelloOk { version: PROTOCOL_VERSION });
                                     } else {
                                         // Reattach: send snapshot to restore screen state.
-                                        // Drop registry lock BEFORE snapshot to avoid deadlock:
-                                        // snapshot() acquires session inner lock, but the PTY
-                                        // reader holds inner lock while sending to the event
-                                        // channel, and the event relay needs the registry lock
-                                        // to drain that channel.
+                                        // Drop registry lock BEFORE snapshot to avoid
+                                        // blocking relay tasks (which need the lock to look
+                                        // up output_tx) — holding it would serialize all
+                                        // concurrent reattaches and stall event draining.
                                         drop(reg);
+                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
+
+                                        // Replace the output channel.  While the registry
+                                        // lock was released the relay task may have
+                                        // forwarded PTY data into the old channel — data
+                                        // that is already baked into the snapshot.  Creating
+                                        // a fresh channel discards that duplicate data so
+                                        // the client doesn't apply it twice (which would
+                                        // push the cursor 1-2 lines below the prompt).
+                                        let mut reg = registry.lock().await;
+                                        let (new_rx, _) = reg.attach(&id)
+                                            .map_err(|e| anyhow::anyhow!(e))?;
+                                        drop(reg);
+
                                         send_snapshot(
                                             &write_codec,
                                             &mut writer,
                                             write_timeout,
-                                            &handle,
-                                            config.scrollback_lines,
+                                            snapshot,
                                         ).await?;
+
+                                        rx = new_rx;
                                     }
 
                                     let reattach = !first_attach;
@@ -396,25 +410,22 @@ async fn send_snapshot(
     codec: &FrameCodec,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     write_timeout: Duration,
-    handle: &std::sync::Arc<SessionHandle>,
-    max_scrollback: usize,
+    mut snapshot: SessionState,
 ) -> anyhow::Result<()> {
-    let mut scrollback_limit = max_scrollback;
     loop {
-        let snapshot = handle.snapshot(scrollback_limit).await;
-        let msg = Message::SessionState(snapshot);
+        let msg = Message::SessionState(snapshot.clone());
         match tokio::time::timeout(write_timeout, codec.write_message(writer, &msg)).await {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(tether_protocol::codec::CodecError::FrameTooLarge(size))) => {
-                if scrollback_limit == 0 {
+                if snapshot.scrollback.is_empty() {
                     warn!(encoded_bytes = size, "snapshot exceeds frame limit even without scrollback");
                     return Err(anyhow::anyhow!("snapshot too large to send ({size} bytes)"));
                 }
-                let prev = scrollback_limit;
-                scrollback_limit /= 2;
+                let prev = snapshot.scrollback.len();
+                snapshot.scrollback.truncate(prev / 2);
                 warn!(
                     prev_limit = prev,
-                    new_limit = scrollback_limit,
+                    new_limit = snapshot.scrollback.len(),
                     encoded_bytes = size,
                     "snapshot too large, reducing scrollback"
                 );
