@@ -1,3 +1,4 @@
+mod panel;
 mod render;
 
 use std::collections::HashMap;
@@ -130,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
 enum PickerAction {
     Resume(String),
     New,
+}
+
+/// What `io_loop` wants the caller to do next.
+enum IoAction {
+    Detach,
+    SessionExited,
+    SwitchTo(String),
+    NewSession,
 }
 
 fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &Option<String>) -> anyhow::Result<PickerAction> {
@@ -384,7 +393,7 @@ async fn run_session(
     attach_only: bool,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer, mut _child) = connect(host, socket, false).await?;
-    let write_codec = FrameCodec::new();
+    let mut write_codec = FrameCodec::new();
     let mut read_codec = FrameCodec::new();
 
     handshake(
@@ -481,138 +490,208 @@ async fn run_session(
         }
     });
 
-    // I/O loop with automatic reconnection on connection loss
-    let result = io_loop(
-        &write_codec,
-        &mut read_codec,
-        writer.as_mut(),
-        reader.as_mut(),
-        &session_id,
-        &mut stdin_rx,
-    )
-    .await;
+    let mut session_id = session_id;
 
-    match result {
-        Ok(()) => Ok(()),
-        Err(ref e) => {
-            // Check if this was a connection loss (not a deliberate detach/exit)
-            let err_msg = format!("{e}");
-            let is_connection_loss = err_msg.contains("connection closed")
-                || err_msg.contains("Broken pipe")
-                || err_msg.contains("Connection reset");
-            if !is_connection_loss {
-                warn!(error = %err_msg, "io_loop exited with non-connection error");
-                return result;
-            }
+    // Main session loop — re-enters io_loop after switching sessions
+    'session: loop {
+        let result = io_loop(
+            &write_codec,
+            &mut read_codec,
+            writer.as_mut(),
+            reader.as_mut(),
+            &session_id,
+            &mut stdin_rx,
+        )
+        .await;
 
-            warn!(error = %err_msg, session = %session_id, "connection lost");
-
-            // Kill the old SSH process so buffered keystrokes aren't
-            // delivered to the remote when the network recovers.
-            if let Some(ref mut child) = _child {
-                info!("killing old ssh process");
-                let _ = child.kill().await;
-            }
-            drop(writer);
-            drop(reader);
-
-            // Reconnect loop with exponential backoff.
-            // Schedule: 1s, 2s, 4s, 8s, 15s, 15s, 15s, ...
-            let mut delay_secs: u64 = 1;
-            let max_delay_secs: u64 = 15;
-            let mut attempt = 0u32;
-
-            {
-                let mut out = std::io::stdout();
-                let _ = write!(out, "\r\n");
-                let _ = out.flush();
-            }
-
-            loop {
-                attempt += 1;
-
-                // Ticking countdown so the user sees progress
-                for remaining in (1..=delay_secs).rev() {
-                    {
-                        let mut out = std::io::stdout();
-                        let _ = write!(out, "\r\x1b[2K[connection lost, retrying in {remaining}s... ctrl-c to quit]");
-                        let _ = out.flush();
+        match result {
+            Ok(IoAction::Detach) | Ok(IoAction::SessionExited) => return Ok(()),
+            Ok(IoAction::SwitchTo(new_id)) => {
+                info!(from = %session_id, to = %new_id, "switching session");
+                write_codec
+                    .write_message(writer.as_mut(), &Message::SessionAttach { id: new_id.clone() })
+                    .await?;
+                match read_codec.read_message(reader.as_mut()).await? {
+                    Message::SessionState(state) => {
+                        let mut stdout = std::io::stdout();
+                        execute!(
+                            stdout,
+                            terminal::Clear(terminal::ClearType::All),
+                            cursor::MoveTo(0, 0)
+                        )?;
+                        render::render_snapshot(&state, &mut stdout)?;
+                        stdout.write_all(b"\x1b[0m")?;
+                        stdout.flush()?;
                     }
-                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
-                    tokio::pin!(sleep);
-                    let interrupted = loop {
-                        tokio::select! {
-                            _ = &mut sleep => break false,
-                            Some(data) = stdin_rx.recv() => {
-                                if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
-                                    break true;
-                                }
-                                // Non-interrupt keypress — ignore and keep waiting
-                            }
-                        }
-                    };
-                    if interrupted {
-                        info!("user interrupted reconnect loop");
-                        return Ok(());
+                    Message::Error { message, .. } => {
+                        eprintln!("\r\n[switch failed: {message}]");
+                        // Stay on the current session
+                        continue 'session;
                     }
+                    _ => {}
                 }
+                session_id = new_id;
+                continue 'session;
+            }
+            Ok(IoAction::NewSession) => {
+                info!("creating new session from panel");
+                let (cols, rows) = terminal::size()?;
+                write_codec
+                    .write_message(
+                        writer.as_mut(),
+                        &Message::SessionCreate {
+                            id: None,
+                            cmd: None,
+                            cols,
+                            rows,
+                            env: session_env(),
+                        },
+                    )
+                    .await?;
+                let new_id = match read_codec.read_message(reader.as_mut()).await? {
+                    Message::SessionCreated { id } => id,
+                    Message::Error { message, .. } => {
+                        eprintln!("\r\n[create failed: {message}]");
+                        continue 'session;
+                    }
+                    _ => continue 'session,
+                };
+                write_codec
+                    .write_message(
+                        writer.as_mut(),
+                        &Message::SessionAttach { id: new_id.clone() },
+                    )
+                    .await?;
+                match read_codec.read_message(reader.as_mut()).await? {
+                    Message::HelloOk { .. } => {
+                        std::io::stdout().write_all(b"\x1b[2J\x1b[H")?;
+                        std::io::stdout().flush()?;
+                    }
+                    Message::SessionState(state) => {
+                        let mut stdout = std::io::stdout();
+                        execute!(
+                            stdout,
+                            terminal::Clear(terminal::ClearType::All),
+                            cursor::MoveTo(0, 0)
+                        )?;
+                        render::render_snapshot(&state, &mut stdout)?;
+                        stdout.write_all(b"\x1b[0m")?;
+                        stdout.flush()?;
+                    }
+                    Message::Error { message, .. } => {
+                        eprintln!("\r\n[attach failed: {message}]");
+                        continue 'session;
+                    }
+                    _ => {}
+                }
+                session_id = new_id;
+                continue 'session;
+            }
+            Err(ref e) => {
+                // Check if this was a connection loss (not a deliberate detach/exit)
+                let err_msg = format!("{e}");
+                let is_connection_loss = err_msg.contains("connection closed")
+                    || err_msg.contains("Broken pipe")
+                    || err_msg.contains("Connection reset");
+                if !is_connection_loss {
+                    warn!(error = %err_msg, "io_loop exited with non-connection error");
+                    return result.map(|_| ());
+                }
+
+                warn!(error = %err_msg, session = %session_id, "connection lost");
+
+                // Kill the old SSH process so buffered keystrokes aren't
+                // delivered to the remote when the network recovers.
+                if let Some(ref mut child) = _child {
+                    info!("killing old ssh process");
+                    let _ = child.kill().await;
+                }
+                drop(writer);
+                drop(reader);
+
+                // Reconnect loop with exponential backoff.
+                // Schedule: 1s, 2s, 4s, 8s, 15s, 15s, 15s, ...
+                let mut delay_secs: u64 = 1;
+                let max_delay_secs: u64 = 15;
+                let mut attempt = 0u32;
 
                 {
                     let mut out = std::io::stdout();
-                    let _ = write!(out, "\r\x1b[2K[reconnecting... attempt {attempt}]");
+                    let _ = write!(out, "\r\n");
                     let _ = out.flush();
                 }
 
-                // Reconnect attempt — interruptible via stdin, with timeout.
-                info!(session = %session_id, attempt, "attempting reconnect");
-                let reconnect_timeout = std::time::Duration::from_secs(10);
-                let result = tokio::select! {
-                    r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
-                        match r {
-                            Ok(inner) => inner,
-                            Err(_) => Err(anyhow::anyhow!("reconnect timed out")),
+                loop {
+                    attempt += 1;
+
+                    // Ticking countdown so the user sees progress
+                    for remaining in (1..=delay_secs).rev() {
+                        {
+                            let mut out = std::io::stdout();
+                            let _ = write!(out, "\r\x1b[2K[connection lost, retrying in {remaining}s... ctrl-c to quit]");
+                            let _ = out.flush();
                         }
-                    }
-                    Some(data) = stdin_rx.recv() => {
-                        if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                        let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
+                        tokio::pin!(sleep);
+                        let interrupted = loop {
+                            tokio::select! {
+                                _ = &mut sleep => break false,
+                                Some(data) = stdin_rx.recv() => {
+                                    if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                                        break true;
+                                    }
+                                }
+                            }
+                        };
+                        if interrupted {
+                            info!("user interrupted reconnect loop");
                             return Ok(());
                         }
-                        Err(anyhow::anyhow!("interrupted"))
                     }
-                };
-                match result {
-                    Ok((reader, writer, read_codec, write_codec, _child)) => {
-                        info!(session = %session_id, "reconnected successfully");
-                        let mut reader = reader;
-                        let mut writer = writer;
-                        let mut read_codec = read_codec;
-                        let result = io_loop(
-                            &write_codec,
-                            &mut read_codec,
-                            writer.as_mut(),
-                            reader.as_mut(),
-                            &session_id,
-                            &mut stdin_rx,
-                        ).await;
-                        match result {
-                            Ok(()) => return Ok(()),
-                            Err(ref e) => {
-                                warn!(error = %e, "connection lost again after reconnect");
-                                delay_secs = 1;
-                                attempt = 0;
+
+                    {
+                        let mut out = std::io::stdout();
+                        let _ = write!(out, "\r\x1b[2K[reconnecting... attempt {attempt}]");
+                        let _ = out.flush();
+                    }
+
+                    info!(session = %session_id, attempt, "attempting reconnect");
+                    let reconnect_timeout = std::time::Duration::from_secs(10);
+                    let result = tokio::select! {
+                        r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
+                            match r {
+                                Ok(inner) => inner,
+                                Err(_) => Err(anyhow::anyhow!("reconnect timed out")),
                             }
                         }
-                    }
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        warn!(error = %msg, "reconnect attempt failed");
-                        if msg.contains("reattach failed") {
-                            let mut out = std::io::stdout();
-                            let _ = write!(out, "\r\x1b[2K[session no longer exists]\r\n");
-                            let _ = out.flush();
-                            return Ok(());
+                        Some(data) = stdin_rx.recv() => {
+                            if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                                return Ok(());
+                            }
+                            Err(anyhow::anyhow!("interrupted"))
                         }
-                        delay_secs = (delay_secs * 2).min(max_delay_secs);
+                    };
+                    match result {
+                        Ok((new_reader, new_writer, new_read_codec, new_write_codec, new_child)) => {
+                            info!(session = %session_id, "reconnected successfully");
+                            reader = new_reader;
+                            writer = new_writer;
+                            read_codec = new_read_codec;
+                            write_codec = new_write_codec;
+                            _child = new_child;
+                            continue 'session;
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            warn!(error = %msg, "reconnect attempt failed");
+                            if msg.contains("reattach failed") {
+                                let mut out = std::io::stdout();
+                                let _ = write!(out, "\r\x1b[2K[session no longer exists]\r\n");
+                                let _ = out.flush();
+                                return Ok(());
+                            }
+                            delay_secs = (delay_secs * 2).min(max_delay_secs);
+                        }
                     }
                 }
             }
@@ -683,7 +762,7 @@ async fn io_loop(
     reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     session_id: &str,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IoAction> {
     let mut stdout = std::io::stdout();
 
     let mut sigwinch =
@@ -695,20 +774,55 @@ async fn io_loop(
     // writes will block until the pipe buffer fills. This detects it early.
     let write_timeout = std::time::Duration::from_secs(5);
 
+    // Control panel state
+    let mut panel_state: Option<panel::PanelState> = None;
+    let mut buffered_output: Vec<Vec<u8>> = Vec::new();
+    let mut buffered_bytes: usize = 0;
+    const MAX_BUFFER: usize = 1024 * 1024; // 1MB
+
+    let close_panel = |stdout: &mut std::io::Stdout,
+                       buffered_output: &mut Vec<Vec<u8>>,
+                       buffered_bytes: &mut usize|
+     -> std::io::Result<()> {
+        execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
+        for chunk in buffered_output.drain(..) {
+            stdout.write_all(&chunk)?;
+        }
+        stdout.flush()?;
+        *buffered_bytes = 0;
+        Ok(())
+    };
+
     loop {
         tokio::select! {
             result = read_codec.read_message(reader) => {
                 match result {
                     Ok(Message::Data(data)) => {
-                        stdout.write_all(&data)?;
-                        stdout.flush()?;
+                        if panel_state.is_some() {
+                            if buffered_bytes < MAX_BUFFER {
+                                buffered_bytes += data.len();
+                                buffered_output.push(data);
+                            }
+                        } else {
+                            stdout.write_all(&data)?;
+                            stdout.flush()?;
+                        }
                     }
                     Ok(Message::SessionExited { id, exit_code }) => {
                         info!(session = %id, exit_code, "session exited");
-                        return Ok(());
+                        if panel_state.is_some() {
+                            close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                            panel_state = None;
+                        }
+                        return Ok(IoAction::SessionExited);
+                    }
+                    Ok(Message::SessionListResp { sessions }) => {
+                        if let Some(ref mut p) = panel_state {
+                            p.update_sessions(sessions);
+                            p.render(&mut stdout)?;
+                        }
                     }
                     Ok(Message::Ping { seq }) => {
-                        // Reply to daemon keepalive
                         let _ = write_codec.write_message(writer, &Message::Pong { seq }).await;
                     }
                     Ok(Message::Pong { .. }) => {}
@@ -716,10 +830,16 @@ async fn io_loop(
                         debug!("unexpected message: {:?}", msg.type_id());
                     }
                     Err(tether_protocol::codec::CodecError::ConnectionClosed) => {
+                        if panel_state.is_some() {
+                            let _ = close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes);
+                        }
                         warn!("io_loop: read returned connection closed");
                         anyhow::bail!("connection closed");
                     }
                     Err(e) => {
+                        if panel_state.is_some() {
+                            let _ = close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes);
+                        }
                         warn!(error = %e, "io_loop: read error");
                         return Err(e.into());
                     }
@@ -727,16 +847,74 @@ async fn io_loop(
             }
 
             Some(data) = stdin_rx.recv() => {
-                // Ctrl-\ detaches immediately — don't wait for the write
                 if data.contains(&DETACH_BYTE) {
-                    info!(session = %session_id, "detach requested (ctrl-\\)");
-                    // Best-effort send, don't block on dead connection
+                    if panel_state.is_some() {
+                        // Ctrl-\ while panel open = detach (double-tap)
+                        close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                        panel_state = None;
+                        info!(session = %session_id, "detach via panel (ctrl-\\)");
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            write_codec.write_message(writer, &Message::SessionDetach),
+                        ).await;
+                        eprintln!("\r\n[detached from {}]", session_id);
+                        return Ok(IoAction::Detach);
+                    }
+                    // Open control panel
+                    info!(session = %session_id, "opening control panel");
+                    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+                    let mut p = panel::PanelState::new(session_id.to_string());
+                    p.render(&mut stdout)?;
+                    panel_state = Some(p);
+                    // Request session list from server
                     let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
-                        write_codec.write_message(writer, &Message::SessionDetach),
+                        write_timeout,
+                        write_codec.write_message(writer, &Message::SessionList),
                     ).await;
-                    eprintln!("\r\n[detached from {}]", session_id);
-                    return Ok(());
+                    continue;
+                }
+
+                if let Some(ref mut p) = panel_state {
+                    // Route input to panel
+                    match p.handle_input(&data) {
+                        Some(panel::PanelAction::Cancel) => {
+                            close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                            panel_state = None;
+                        }
+                        Some(panel::PanelAction::Detach) => {
+                            close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                            panel_state = None;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(500),
+                                write_codec.write_message(writer, &Message::SessionDetach),
+                            ).await;
+                            eprintln!("\r\n[detached from {}]", session_id);
+                            return Ok(IoAction::Detach);
+                        }
+                        Some(panel::PanelAction::SwitchTo(id)) => {
+                            close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                            panel_state = None;
+                            return Ok(IoAction::SwitchTo(id));
+                        }
+                        Some(panel::PanelAction::NewSession) => {
+                            close_panel(&mut stdout, &mut buffered_output, &mut buffered_bytes)?;
+                            panel_state = None;
+                            return Ok(IoAction::NewSession);
+                        }
+                        Some(panel::PanelAction::KillSession(id)) => {
+                            p.remove_session(&id);
+                            let _ = tokio::time::timeout(
+                                write_timeout,
+                                write_codec.write_message(writer, &Message::SessionDestroy { id }),
+                            ).await;
+                            p.render(&mut stdout)?;
+                        }
+                        None => {
+                            // Navigation — re-render
+                            p.render(&mut stdout)?;
+                        }
+                    }
+                    continue;
                 }
 
                 // Normal data — timeout protects against dead connection
@@ -757,6 +935,12 @@ async fn io_loop(
             }
 
             _ = sigwinch.recv() => {
+                if let Some(ref mut p) = panel_state {
+                    if let Ok((cols, rows)) = terminal::size() {
+                        p.resize(cols, rows);
+                        p.render(&mut stdout)?;
+                    }
+                }
                 if let Ok((cols, rows)) = terminal::size() {
                     let _ = tokio::time::timeout(
                         write_timeout,
@@ -766,10 +950,12 @@ async fn io_loop(
             }
 
             _ = sigint.recv() => {
-                let _ = tokio::time::timeout(
-                    write_timeout,
-                    write_codec.write_message(writer, &Message::Data(vec![0x03])),
-                ).await;
+                if panel_state.is_none() {
+                    let _ = tokio::time::timeout(
+                        write_timeout,
+                        write_codec.write_message(writer, &Message::Data(vec![0x03])),
+                    ).await;
+                }
             }
         }
     }

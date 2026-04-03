@@ -3,17 +3,42 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 const ADJECTIVES: &[&str] = &[
-    "bright", "calm", "dark", "eager", "fast",
-    "glad", "happy", "idle", "keen", "light",
-    "mild", "neat", "odd", "plain", "quick",
-    "rare", "safe", "tall", "warm", "young",
+    "bold",   "brave",  "bright", "brisk",  "calm",
+    "clean",  "clear",  "cool",   "crisp",  "dark",
+    "deep",   "dry",    "eager",  "fair",   "fast",
+    "fierce", "fine",   "firm",   "fleet",  "free",
+    "fresh",  "frost",  "glad",   "gold",   "grand",
+    "green",  "grey",   "happy",  "high",   "idle",
+    "jade",   "keen",   "light",  "live",   "lone",
+    "low",    "lush",   "mild",   "neat",   "new",
+    "north",  "odd",    "pale",   "plain",  "prime",
+    "proud",  "pure",   "quick",  "rare",   "red",
+    "rich",   "rough",  "rust",   "safe",   "sharp",
+    "shy",    "slim",   "slow",   "soft",   "south",
+    "stark",  "steep",  "still",  "strong", "sure",
+    "sweet",  "swift",  "tall",   "tame",   "thin",
+    "true",   "vast",   "warm",   "west",   "white",
+    "wide",   "wild",   "young",
 ];
 
 const NOUNS: &[&str] = &[
-    "fox", "owl", "elm", "bay", "dew",
-    "sky", "oak", "bee", "fir", "jay",
-    "lake", "pine", "rain", "star", "wave",
-    "moon", "peak", "reef", "wind", "bear",
+    "ash",    "bay",    "bear",   "bee",    "birch",
+    "brook",  "cave",   "cliff",  "cloud",  "colt",
+    "cove",   "crane",  "creek",  "crow",   "dale",
+    "dawn",   "deer",   "dew",    "dove",   "dusk",
+    "elm",    "fawn",   "fern",   "finch",  "fir",
+    "flame",  "flint",  "fog",    "fox",    "glen",
+    "grove",  "gull",   "hare",   "hawk",   "haze",
+    "heath",  "heron",  "hill",   "isle",   "ivy",
+    "jay",    "lake",   "lark",   "leaf",   "lynx",
+    "marsh",  "moon",   "moss",   "nest",   "oak",
+    "owl",    "peak",   "pine",   "plum",   "pond",
+    "quail",  "rain",   "reef",   "ridge",  "rook",
+    "sage",   "shade",  "shore",  "sky",    "slope",
+    "snipe",  "spring", "star",   "stone",  "stork",
+    "storm",  "stream", "thorn",  "tide",   "trail",
+    "trout",  "vale",   "vine",   "vole",   "wave",
+    "wind",   "wren",
 ];
 
 pub fn generate_id() -> String {
