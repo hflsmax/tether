@@ -258,7 +258,7 @@ impl PanelState {
             }
             Key::Char('d') | Key::CtrlBackslash => Some(PanelAction::Detach),
             Key::Esc | Key::CtrlC => Some(PanelAction::Cancel),
-            Key::Unknown => None,
+            Key::Unknown | Key::Char(_) => None,
         }
     }
 
