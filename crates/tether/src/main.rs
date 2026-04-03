@@ -175,8 +175,12 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
         // Full redraw on clean screen
         execute!(out, cursor::MoveTo(0, 0), terminal::Clear(terminal::ClearType::All))?;
 
-        write!(out, "  {:<18} {:<12} {:<24} {:<8} IDLE\r\n",
-            "NAME", "RUNNING", "CWD", "AGE")?;
+        let term_cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+        // 4 columns split equally; reserve arrow(2) + suffix(12) = 14
+        let col_w = (term_cols.saturating_sub(14) / 4).max(6).min(30);
+
+        write!(out, "  {:<col_w$} {:<col_w$} {:<col_w$} {}\r\n",
+            "RUNNING", "CWD", "AGE", "IDLE")?;
 
         if sel == 0 { write!(out, "\x1b[7m")?; }
         write!(out, "{} [new session]\x1b[0m\r\n", if sel == 0 { ">" } else { " " })?;
@@ -186,27 +190,22 @@ fn run_picker(sessions: &mut Vec<SessionInfo>, host: &Option<String>, socket: &O
             let proc_name = if s.foreground_proc.is_empty() { "-" } else { &s.foreground_proc };
             let age = format_duration(s.created_secs);
             let idle = format_duration(s.idle_secs);
-            let cwd = shorten_path(&s.cwd);
+            let cwd = truncate_path(&shorten_path(&s.cwd), col_w - 1);
+            let proc_name = truncate_path(proc_name, col_w - 1);
 
             if s.attached {
-                // Dim attached sessions
                 write!(out, "\x1b[2m")?;
             } else if sel == idx {
                 write!(out, "\x1b[7m")?;
             }
             let suffix = if s.attached { " (attached)" } else { "" };
-            write!(out, "{} {:<18} {:<12} {:<24} {:<8} {}{}\x1b[0m\r\n",
-                if sel == idx && !s.attached { ">" } else { " " }, s.id, proc_name, cwd, age, idle, suffix)?;
+            write!(out, "{} {:<col_w$} {:<col_w$} {:<col_w$} {}{}\x1b[0m\r\n",
+                if sel == idx && !s.attached { ">" } else { " " }, proc_name, cwd, age, idle, suffix)?;
         }
 
         write!(out, "\r\n")?;
         write!(out, "  enter: select  x: kill  q: quit\r\n")?;
         out.flush()?;
-
-        if sessions.is_empty() {
-            leave(&mut out)?;
-            return Ok(PickerAction::New);
-        }
 
         if let Event::Key(ev @ KeyEvent { kind: KeyEventKind::Press, .. }) = event::read()? {
             let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
@@ -285,10 +284,6 @@ async fn auto_connect(
 
     drop(reader);
     drop(writer);
-
-    if sessions.is_empty() {
-        return run_session(host, socket, None, None, false).await;
-    }
 
     match run_picker(&mut sessions, host, socket)? {
         PickerAction::Resume(id) => {
@@ -857,7 +852,7 @@ async fn io_loop(
                             std::time::Duration::from_millis(500),
                             write_codec.write_message(writer, &Message::SessionDetach),
                         ).await;
-                        eprintln!("\r\n[detached from {}]", session_id);
+                        eprintln!("\r\n[detached]");
                         return Ok(IoAction::Detach);
                     }
                     // Open control panel
@@ -888,7 +883,7 @@ async fn io_loop(
                                 std::time::Duration::from_millis(500),
                                 write_codec.write_message(writer, &Message::SessionDetach),
                             ).await;
-                            eprintln!("\r\n[detached from {}]", session_id);
+                            eprintln!("\r\n[detached]");
                             return Ok(IoAction::Detach);
                         }
                         Some(panel::PanelAction::SwitchTo(id)) => {
@@ -989,4 +984,14 @@ fn shorten_path(path: &str) -> String {
         return format!("~{rest}");
     }
     path.to_string()
+}
+
+fn truncate_path(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 3 {
+        s[..max].to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
 }

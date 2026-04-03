@@ -78,18 +78,23 @@ impl PanelState {
     pub fn render(&self, out: &mut impl Write) -> std::io::Result<()> {
         write!(out, "\x1b[H\x1b[2J")?; // clear screen, cursor to top
 
-        write!(out, "\r\n  \x1b[1mtether\x1b[0m \u{2500} ctrl-\\ control panel\r\n\r\n")?;
+        write!(out, "\r\n  \x1b[1mtether sessions\x1b[0m\r\n\r\n")?;
 
         match &self.sessions {
             None => {
                 write!(out, "  loading...\r\n")?;
             }
             Some(sessions) => {
+                // 4 columns split equally across available width
+                // Reserve: arrow(2) + suffix(12) = 14 chars for non-column content
+                let avail = (self.cols as usize).saturating_sub(14);
+                let col_w = (avail / 4).max(6).min(30);
+
                 // Header
                 write!(
                     out,
-                    "  {:<20} {:<12} {:<24} {:<8} IDLE\r\n",
-                    "NAME", "RUNNING", "CWD", "AGE"
+                    "  {:<col_w$} {:<col_w$} {:<col_w$} {}\r\n",
+                    "RUNNING", "CWD", "AGE", "IDLE"
                 )?;
 
                 for (i, s) in sessions.iter().enumerate() {
@@ -101,17 +106,18 @@ impl PanelState {
                     };
                     let age = format_duration(s.created_secs);
                     let idle = format_duration(s.idle_secs);
-                    let cwd = shorten_path(&s.cwd);
+                    let cwd = truncate_str(&shorten_path(&s.cwd), col_w - 1);
+                    let proc_name = truncate_str(proc_name, col_w - 1);
 
-                    let marker = if is_current { "*" } else { " " };
-                    let suffix = if s.attached && !is_current {
+                    let suffix = if is_current {
+                        " (current)"
+                    } else if s.attached {
                         " (attached)"
                     } else {
                         ""
                     };
 
                     if s.attached && !is_current {
-                        // Dim non-current attached sessions
                         write!(out, "\x1b[2m")?;
                     } else if self.selected == i {
                         write!(out, "\x1b[7m")?;
@@ -124,8 +130,8 @@ impl PanelState {
                     };
                     write!(
                         out,
-                        "{} {:<18}{} {:<12} {:<24} {:<8} {}{}\x1b[0m\r\n",
-                        arrow, s.id, marker, proc_name, cwd, age, idle, suffix
+                        "{} {:<col_w$} {:<col_w$} {:<col_w$} {}{}\x1b[0m\r\n",
+                        arrow, proc_name, cwd, age, idle, suffix
                     )?;
                 }
 
@@ -155,19 +161,37 @@ impl PanelState {
         let mut i = 0;
         while i < raw.len() {
             let key = if raw[i] == 0x1b {
-                // Escape sequence
-                if i + 2 < raw.len() && raw[i + 1] == b'[' {
-                    let code = raw[i + 2];
-                    i += 3;
-                    match code {
-                        b'A' => Key::Up,
-                        b'B' => Key::Down,
-                        _ => Key::Unknown,
+                if i + 1 >= raw.len() {
+                    // \x1b at end of buffer — could be ESC or start
+                    // of a split escape sequence. Treat as unknown;
+                    // user can press q instead.
+                    i += 1;
+                    Key::Unknown
+                } else if raw[i + 1] == b'[' || raw[i + 1] == b'O' {
+                    // CSI (\x1b[) or SS3 (\x1bO) — both used for arrows
+                    if i + 2 < raw.len() {
+                        let code = raw[i + 2];
+                        i += 3;
+                        // Skip any remaining CSI parameters (e.g. \x1b[1;5A)
+                        while i < raw.len() && raw[i - 1] != code {
+                            // already consumed the final byte above
+                            break;
+                        }
+                        match code {
+                            b'A' => Key::Up,
+                            b'B' => Key::Down,
+                            _ => Key::Unknown,
+                        }
+                    } else {
+                        // Incomplete sequence — skip
+                        i += 2;
+                        Key::Unknown
                     }
                 } else {
-                    i += 1;
-                    // Lone ESC
-                    Key::Esc
+                    // \x1b followed by something else — skip both bytes
+                    // to avoid misinterpreting escape sequences as Esc
+                    i += 2;
+                    Key::Unknown
                 }
             } else {
                 let b = raw[i];
@@ -305,4 +329,14 @@ fn shorten_path(path: &str) -> String {
         return format!("~{rest}");
     }
     path.to_string()
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 3 {
+        s[..max].to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
 }
