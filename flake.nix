@@ -78,6 +78,8 @@
         devShells.default = craneLib.devShell {
           checks = self.checks.${system};
           packages = with pkgs; [
+            gcc
+            pkg-config
             rust-analyzer
             cargo-watch
             cargo-nextest

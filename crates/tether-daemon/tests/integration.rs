@@ -857,7 +857,7 @@ async fn test_auto_generated_session_id() {
     let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
     let (mut reader, mut writer) = stream.into_split();
 
-    // Create with id: None — should get auto-generated adjective-noun ID
+    // Create with id: None — should get auto-generated numeric ID
     write_codec
         .write_message(
             &mut writer,
@@ -875,7 +875,7 @@ async fn test_auto_generated_session_id() {
     let resp = read_codec.read_message(&mut reader).await.unwrap();
     match resp {
         Message::SessionCreated { id } => {
-            assert!(id.contains('-'), "auto ID should be adjective-noun format: {id}");
+            assert!(id.chars().all(|c| c.is_ascii_digit()), "auto ID should be numeric: {id}");
             assert!(!id.is_empty());
         }
         other => panic!("expected SessionCreated, got: {other:?}"),

@@ -604,66 +604,83 @@ async fn run_session(
                 drop(writer);
                 drop(reader);
 
-                // Reconnect loop with exponential backoff.
-                // Schedule: 1s, 2s, 4s, 8s, 15s, 15s, 15s, ...
-                let mut delay_secs: u64 = 1;
-                let max_delay_secs: u64 = 15;
+                // Wait for user to press Enter to retry, with a spinner
+                // animation so they know we're alive.
                 let mut attempt = 0u32;
+                let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
                 {
                     let mut out = std::io::stdout();
-                    let _ = write!(out, "\r\n");
+                    let _ = write!(out, "\r\n\r\x1b[2K[connection lost — press Enter to reconnect, ctrl-c to quit]");
                     let _ = out.flush();
                 }
 
+                // Animate spinner while waiting for Enter
+                let mut spin_idx: usize = 0;
+                let mut status_msg = "connection lost";
                 loop {
-                    attempt += 1;
-
-                    // Ticking countdown so the user sees progress
-                    for remaining in (1..=delay_secs).rev() {
-                        {
-                            let mut out = std::io::stdout();
-                            let _ = write!(out, "\r\x1b[2K[connection lost, retrying in {remaining}s... ctrl-c to quit]");
-                            let _ = out.flush();
-                        }
-                        let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
-                        tokio::pin!(sleep);
-                        let interrupted = loop {
-                            tokio::select! {
-                                _ = &mut sleep => break false,
-                                Some(data) = stdin_rx.recv() => {
-                                    if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
-                                        break true;
-                                    }
-                                }
-                            }
-                        };
-                        if interrupted {
-                            info!("user interrupted reconnect loop");
-                            return Ok(());
-                        }
-                    }
-
                     {
                         let mut out = std::io::stdout();
-                        let _ = write!(out, "\r\x1b[2K[reconnecting... attempt {attempt}]");
+                        let _ = write!(out, "\r\x1b[2K {} [{status_msg} — press Enter to reconnect, ctrl-c to quit]", spinner[spin_idx % spinner.len()]);
                         let _ = out.flush();
+                        spin_idx += 1;
                     }
+                    let tick = tokio::time::sleep(std::time::Duration::from_millis(80));
+                    tokio::pin!(tick);
+                    let action = tokio::select! {
+                        _ = &mut tick => None,
+                        Some(data) = stdin_rx.recv() => Some(data),
+                    };
+                    match action {
+                        None => continue, // just animate
+                        Some(data) => {
+                            if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                                info!("user interrupted reconnect loop");
+                                return Ok(());
+                            }
+                            if data.contains(&b'\r') || data.contains(&b'\n') {
+                                // User pressed Enter — attempt reconnect
+                            } else {
+                                continue; // ignore other keys
+                            }
+                        }
+                    }
+
+                    attempt += 1;
+                    spin_idx = 0;
 
                     info!(session = %session_id, attempt, "attempting reconnect");
                     let reconnect_timeout = std::time::Duration::from_secs(10);
-                    let result = tokio::select! {
-                        r = tokio::time::timeout(reconnect_timeout, try_reconnect(host, socket, &session_id)) => {
-                            match r {
-                                Ok(inner) => inner,
-                                Err(_) => Err(anyhow::anyhow!("reconnect timed out")),
-                            }
+                    let reconnect_fut = tokio::time::timeout(
+                        reconnect_timeout,
+                        try_reconnect(host, socket, &session_id),
+                    );
+                    tokio::pin!(reconnect_fut);
+
+                    // Animate spinner while reconnecting
+                    let result = loop {
+                        {
+                            let mut out = std::io::stdout();
+                            let _ = write!(out, "\r\x1b[2K {} [reconnecting... attempt {attempt}]", spinner[spin_idx % spinner.len()]);
+                            let _ = out.flush();
+                            spin_idx += 1;
                         }
-                        Some(data) = stdin_rx.recv() => {
-                            if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
-                                return Ok(());
+                        let tick = tokio::time::sleep(std::time::Duration::from_millis(80));
+                        tokio::pin!(tick);
+                        tokio::select! {
+                            r = &mut reconnect_fut => {
+                                break match r {
+                                    Ok(inner) => inner,
+                                    Err(_) => Err(anyhow::anyhow!("reconnect timed out")),
+                                };
                             }
-                            Err(anyhow::anyhow!("interrupted"))
+                            _ = &mut tick => {} // keep spinning
+                            Some(data) = stdin_rx.recv() => {
+                                if data.contains(&0x03) || data.contains(&DETACH_BYTE) || data.contains(&0x04) {
+                                    return Ok(());
+                                }
+                                // ignore other keys during reconnect
+                            }
                         }
                     };
                     match result {
@@ -685,7 +702,7 @@ async fn run_session(
                                 let _ = out.flush();
                                 return Ok(());
                             }
-                            delay_secs = (delay_secs * 2).min(max_delay_secs);
+                            status_msg = "reconnect failed";
                         }
                     }
                 }
