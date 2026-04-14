@@ -104,7 +104,7 @@ async fn read_non_data(
     timeout(Duration::from_secs(5), async {
         loop {
             let msg = read_codec.read_message(reader).await.unwrap();
-            if !matches!(msg, Message::Data(_)) {
+            if !matches!(msg, Message::Data(_) | Message::Ping { .. }) {
                 return msg;
             }
         }
@@ -722,7 +722,7 @@ async fn test_connection_drop_detaches_session() {
     let (mut r2, mut w2) = stream2.into_split();
 
     wc2.write_message(&mut w2, &Message::SessionList).await.unwrap();
-    let resp = rc2.read_message(&mut r2).await.unwrap();
+    let resp = read_non_data(&mut rc2, &mut r2).await;
     match &resp {
         Message::SessionListResp { sessions } => {
             assert_eq!(sessions.len(), 1);
