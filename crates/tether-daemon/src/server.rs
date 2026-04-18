@@ -188,101 +188,111 @@ async fn handle_connection(
                             attached = None;
 
                             let mut reg = registry.lock().await;
-                            match reg.attach(&id) {
-                                Ok((mut rx, event_rx_opt)) => {
-                                    let handle = match reg.take_handle(&id) {
-                                        Some(h) => h,
-                                        None => {
-                                            drop(reg);
-                                            timed_write!(
-                                                &Message::Error { code: 11, message: "session handle missing".into() }
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                    let first_attach = event_rx_opt.is_some();
-
-                                    if first_attach {
-                                        // First attach: skip snapshot — shell just started
-                                        // and raw output with proper colors will follow.
-                                        drop(reg);
-                                        timed_write!(&Message::HelloOk { version: PROTOCOL_VERSION });
-                                    } else {
-                                        // Reattach: send snapshot to restore screen state.
-                                        // Drop registry lock BEFORE snapshot to avoid
-                                        // blocking relay tasks (which need the lock to look
-                                        // up output_tx) — holding it would serialize all
-                                        // concurrent reattaches and stall event draining.
-                                        drop(reg);
-                                        let snapshot = handle.snapshot(config.scrollback_lines).await;
-
-                                        // Replace the output channel.  While the registry
-                                        // lock was released the relay task may have
-                                        // forwarded PTY data into the old channel — data
-                                        // that is already baked into the snapshot.  Creating
-                                        // a fresh channel discards that duplicate data so
-                                        // the client doesn't apply it twice (which would
-                                        // push the cursor 1-2 lines below the prompt).
-                                        let mut reg = registry.lock().await;
-                                        let (new_rx, _) = reg.attach(&id)
-                                            .map_err(|e| anyhow::anyhow!(e))?;
-                                        drop(reg);
-
-                                        send_snapshot(
-                                            &write_codec,
-                                            &mut writer,
-                                            write_timeout,
-                                            snapshot,
-                                        ).await?;
-
-                                        rx = new_rx;
-                                    }
-
-                                    let reattach = !first_attach;
-                                    info!(session = %id, reattach, "client attached");
-
-                                    attached = Some(AttachState {
-                                        id: id.clone(),
-                                        handle: handle.clone(),
-                                        output_rx: rx,
-                                    });
-
-                                    if let Some(mut erx) = event_rx_opt {
-                                        let reg_clone = registry.clone();
-                                        let session_id = id.clone();
-                                        tokio::spawn(async move {
-                                            while let Some(event) = erx.recv().await {
-                                                match event {
-                                                    SessionEvent::Output(data) => {
-                                                        // Get sender without holding lock across send
-                                                        let tx = {
-                                                            let reg = reg_clone.lock().await;
-                                                            reg.get_output_tx(&session_id).cloned()
-                                                        };
-                                                        if let Some(tx) = tx {
-                                                            // Lock is already released, so this
-                                                            // send can't deadlock even if it blocks.
-                                                            let _ = tx.send(data).await;
-                                                        }
-                                                    }
-                                                    SessionEvent::Exited(code) => {
-                                                        info!(session = %session_id, exit_code = code, "session process exited");
-                                                        let mut reg = reg_clone.lock().await;
-                                                        reg.mark_exited(&session_id);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
+                            let (rx, event_rx_opt) = match reg.attach(&id) {
+                                Ok(r) => r,
                                 Err(e) => {
                                     drop(reg);
-                                    timed_write!(
-                                        &Message::Error { code: 11, message: e }
-                                    );
+                                    timed_write!(&Message::Error { code: 11, message: e });
+                                    continue;
                                 }
+                            };
+
+                            let handle = match reg.take_handle(&id) {
+                                Some(h) => h,
+                                None => {
+                                    // Undo the attach we just did, otherwise output_tx
+                                    // would stay pinned with no client on the other side.
+                                    reg.detach(&id);
+                                    drop(reg);
+                                    timed_write!(
+                                        &Message::Error { code: 11, message: "session handle missing".into() }
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let first_attach = event_rx_opt.is_some();
+
+                            // Commit local attached state BEFORE any fallible I/O
+                            // (HelloOk write, snapshot compute, snapshot write). If any
+                            // of those fail, the end-of-function cleanup will call
+                            // reg.detach(&id) and clear output_tx. Without this, a
+                            // failure here would leak the session as "attached" forever
+                            // because cleanup checks `attached.is_some()`.
+                            attached = Some(AttachState {
+                                id: id.clone(),
+                                handle: handle.clone(),
+                                output_rx: rx,
+                            });
+
+                            if first_attach {
+                                // First attach: skip snapshot — shell just started
+                                // and raw output with proper colors will follow.
+                                drop(reg);
+                                timed_write!(&Message::HelloOk { version: PROTOCOL_VERSION });
+                            } else {
+                                // Reattach: send snapshot to restore screen state.
+                                // Drop registry lock BEFORE snapshot to avoid
+                                // blocking relay tasks (which need the lock to look
+                                // up output_tx) — holding it would serialize all
+                                // concurrent reattaches and stall event draining.
+                                drop(reg);
+                                let snapshot = handle.snapshot(config.scrollback_lines).await;
+
+                                // Replace the output channel.  While the registry
+                                // lock was released the relay task may have
+                                // forwarded PTY data into the old channel — data
+                                // that is already baked into the snapshot.  Creating
+                                // a fresh channel discards that duplicate data so
+                                // the client doesn't apply it twice (which would
+                                // push the cursor 1-2 lines below the prompt).
+                                let mut reg = registry.lock().await;
+                                let (new_rx, _) = reg.attach(&id)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                drop(reg);
+
+                                send_snapshot(
+                                    &write_codec,
+                                    &mut writer,
+                                    write_timeout,
+                                    snapshot,
+                                ).await?;
+
+                                if let Some(ref mut state) = attached {
+                                    state.output_rx = new_rx;
+                                }
+                            }
+
+                            let reattach = !first_attach;
+                            info!(session = %id, reattach, "client attached");
+
+                            if let Some(mut erx) = event_rx_opt {
+                                let reg_clone = registry.clone();
+                                let session_id = id.clone();
+                                tokio::spawn(async move {
+                                    while let Some(event) = erx.recv().await {
+                                        match event {
+                                            SessionEvent::Output(data) => {
+                                                // Get sender without holding lock across send
+                                                let tx = {
+                                                    let reg = reg_clone.lock().await;
+                                                    reg.get_output_tx(&session_id).cloned()
+                                                };
+                                                if let Some(tx) = tx {
+                                                    // Lock is already released, so this
+                                                    // send can't deadlock even if it blocks.
+                                                    let _ = tx.send(data).await;
+                                                }
+                                            }
+                                            SessionEvent::Exited(code) => {
+                                                info!(session = %session_id, exit_code = code, "session process exited");
+                                                let mut reg = reg_clone.lock().await;
+                                                reg.mark_exited(&session_id);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
 

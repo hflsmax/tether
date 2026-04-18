@@ -1869,3 +1869,89 @@ async fn test_steal_notifies_old_client() {
 
     std::fs::remove_file(&socket_path).ok();
 }
+
+/// Regression: if a SessionAttach handler calls `reg.attach()` (which sets
+/// `output_tx = Some(...)` on the session) but a subsequent write fails
+/// because the client already hung up, the session must not stay pinned as
+/// "attached" forever. Previously the handler only called `reg.detach()` on
+/// end-of-function cleanup when its local `attached` var was Some, but that
+/// var was only set AFTER the snapshot write — so a write failure during
+/// reattach left the registry thinking a client was still attached.
+#[tokio::test]
+async fn test_reattach_write_failure_does_not_leak_attached() {
+    let socket_path = test_socket_path("reattach-leak");
+    let _daemon = start_daemon(&socket_path).await;
+
+    // Create the session via a clean attach/detach so subsequent attaches
+    // take the reattach code path (which builds + sends a snapshot).
+    let (wc, mut rc, stream) = connect_and_handshake(&socket_path).await;
+    let (mut r, mut w) = stream.into_split();
+    create_and_attach(&wc, &mut rc, &mut r, &mut w, "leak-test").await;
+    wc.write_message(&mut w, &Message::SessionDetach).await.unwrap();
+    drop(r);
+    drop(w);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Reattach, then hang up before the daemon writes the snapshot. The
+    // daemon's snapshot write will fail with BrokenPipe; without the fix
+    // the session stays pinned with output_tx = Some and detached_at = None.
+    {
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let (mut r2, mut w2) = stream.into_split();
+        let wc2 = FrameCodec::new();
+        let mut rc2 = FrameCodec::new();
+        wc2.write_message(
+            &mut w2,
+            &Message::Hello {
+                version: PROTOCOL_VERSION,
+                term: "xterm-256color".into(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        let resp = rc2.read_message(&mut r2).await.unwrap();
+        assert!(matches!(resp, Message::HelloOk { .. }));
+        wc2.write_message(&mut w2, &Message::SessionAttach { id: "leak-test".into() })
+            .await
+            .unwrap();
+        // Drop without reading. The daemon will try to write the snapshot
+        // and fail because the peer has closed.
+        drop(r2);
+        drop(w2);
+    }
+
+    // Give the daemon time to process the write failure and clean up.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A fresh connection must see the session as NOT attached.
+    let (wc3, mut rc3, stream3) = connect_and_handshake(&socket_path).await;
+    let (mut r3, mut w3) = stream3.into_split();
+    wc3.write_message(&mut w3, &Message::SessionList).await.unwrap();
+    let resp = read_non_data(&mut rc3, &mut r3).await;
+    match resp {
+        Message::SessionListResp { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "leak-test");
+            assert!(
+                !sessions[0].attached,
+                "session must not be pinned as attached after a failed reattach write"
+            );
+        }
+        other => panic!("expected SessionListResp, got: {other:?}"),
+    }
+
+    // And a fresh attach must still succeed — the session should be
+    // fully usable after the failed reattach.
+    wc3.write_message(&mut w3, &Message::SessionAttach { id: "leak-test".into() })
+        .await
+        .unwrap();
+    let resp = read_non_data(&mut rc3, &mut r3).await;
+    assert!(
+        matches!(resp, Message::SessionState(_)),
+        "reattach after failed-attach cleanup should succeed, got: {resp:?}"
+    );
+
+    std::fs::remove_file(&socket_path).ok();
+}
