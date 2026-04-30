@@ -764,6 +764,14 @@ async fn try_reconnect(
         _ => {}
     }
 
+    // Send current terminal size so the server PTY matches and the shell
+    // receives SIGWINCH, forcing a full redraw that clears any artifacts.
+    if let Ok((cols, rows)) = terminal::size() {
+        write_codec
+            .write_message(writer.as_mut(), &Message::Resize { cols, rows })
+            .await?;
+    }
+
     Ok((reader, writer, read_codec, write_codec, _child))
 }
 
