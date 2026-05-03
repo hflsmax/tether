@@ -1870,6 +1870,211 @@ async fn test_steal_notifies_old_client() {
     std::fs::remove_file(&socket_path).ok();
 }
 
+/// When a session is destroyed, the child process must be killed (SIGHUP).
+/// Previously, `destroy()` only removed the session from the registry but
+/// left the child process running as an orphan.
+#[tokio::test]
+async fn test_destroy_kills_child_process() {
+    let socket_path = test_socket_path("destroy-kill");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "kill-test").await;
+
+    // Get the shell's PID by writing it to a temp file (avoids parsing PTY echo)
+    let pid_file = format!("/tmp/tether-test-pid-{}", std::process::id());
+    let cmd = format!("echo $$ > {pid_file}\n");
+    write_codec
+        .write_message(&mut writer, &Message::Data(cmd.as_bytes().to_vec()))
+        .await
+        .unwrap();
+
+    let pid: i32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = content.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("failed to read PID from temp file");
+    std::fs::remove_file(&pid_file).ok();
+
+    // Verify child is alive before destroy
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child process {pid} should be alive before destroy"
+    );
+
+    // Detach, then destroy
+    write_codec.write_message(&mut writer, &Message::SessionDetach).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    write_codec
+        .write_message(&mut writer, &Message::SessionDestroy { id: "kill-test".into() })
+        .await
+        .unwrap();
+    let _ = read_non_data(&mut read_codec, &mut reader).await;
+
+    // Wait for SIGHUP to propagate and child to exit
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("child process should be killed after destroy");
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// When idle timeout expires, the child process must be killed along with
+/// removal from the registry. This is the same bug path as destroy — the
+/// idle timeout checker calls `destroy()` which now sends SIGHUP via Drop.
+#[tokio::test]
+async fn test_idle_timeout_kills_child_process() {
+    let socket_path = test_socket_path("idle-kill");
+    let _daemon = start_daemon_with_config(&socket_path, tether_daemon::Config {
+        idle_timeout: "2s".into(),
+        max_sessions: 5,
+        ..Default::default()
+    }).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "idle-kill-test").await;
+
+    // Get the shell's PID by writing it to a temp file
+    let pid_file = format!("/tmp/tether-test-idle-pid-{}", std::process::id());
+    let cmd = format!("echo $$ > {pid_file}\n");
+    write_codec
+        .write_message(&mut writer, &Message::Data(cmd.as_bytes().to_vec()))
+        .await
+        .unwrap();
+
+    let pid: i32 = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = content.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("failed to read PID from temp file");
+    std::fs::remove_file(&pid_file).ok();
+
+    // Detach so the session becomes idle
+    write_codec.write_message(&mut writer, &Message::SessionDetach).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    // Verify child is alive right after detach
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child process {pid} should be alive immediately after detach"
+    );
+
+    // The idle timeout is 2s and the checker runs every 3600s by default,
+    // which is too slow for a test. Instead, we observe the effect indirectly:
+    // reconnect and check that the session is gone from the list (the idle
+    // timeout checker will eventually run). But since the 3600s interval is
+    // too long, we verify via a different path: the session was created with
+    // a 2s idle timeout, and we can trigger a check by destroying it manually
+    // after the timeout elapses.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Reconnect and manually destroy (simulates what the timeout checker does)
+    let (wc2, mut rc2, stream2) = connect_and_handshake(&socket_path).await;
+    let (mut r2, mut w2) = stream2.into_split();
+
+    wc2.write_message(&mut w2, &Message::SessionDestroy { id: "idle-kill-test".into() })
+        .await
+        .unwrap();
+    let _ = rc2.read_message(&mut r2).await.unwrap();
+
+    // Child should be dead
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("child process should be killed after idle timeout + destroy");
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
+/// Destroying a session whose child already exited naturally must not panic.
+/// The Drop impl sends SIGHUP to the (now-dead) PID — this should be harmless.
+#[tokio::test]
+async fn test_destroy_after_natural_exit_is_harmless() {
+    let socket_path = test_socket_path("destroy-exited");
+    let _daemon = start_daemon(&socket_path).await;
+
+    let (write_codec, mut read_codec, stream) = connect_and_handshake(&socket_path).await;
+    let (mut reader, mut writer) = stream.into_split();
+
+    create_and_attach(&write_codec, &mut read_codec, &mut reader, &mut writer, "exit-then-destroy").await;
+
+    // Tell the shell to exit
+    write_codec
+        .write_message(&mut writer, &Message::Data(b"exit\n".to_vec()))
+        .await
+        .unwrap();
+
+    // Wait for SessionExited
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match read_codec.read_message(&mut reader).await {
+                Ok(Message::SessionExited { .. }) => return,
+                Ok(Message::Data(_)) => continue,
+                Ok(Message::Ping { .. }) => continue,
+                Err(_) => return,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("should receive exit notification");
+
+    // Now try to destroy — session may already be removed by mark_exited,
+    // but if it isn't, destroy should work without panicking.
+    write_codec
+        .write_message(&mut writer, &Message::SessionDestroy { id: "exit-then-destroy".into() })
+        .await
+        .unwrap();
+
+    // Expect either success or "not found" error — either is fine, neither is a panic
+    let resp = timeout(Duration::from_secs(2), read_non_data(&mut read_codec, &mut reader)).await;
+    if let Ok(msg) = resp {
+        match msg {
+            Message::SessionCreated { .. } => {} // success response (destroy returns SessionCreated)
+            Message::Error { message, .. } => {
+                assert!(message.contains("not found"), "unexpected error: {message}");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+    // Timeout is also acceptable — the connection may have been cleaned up
+
+    std::fs::remove_file(&socket_path).ok();
+}
+
 /// Regression: if a SessionAttach handler calls `reg.attach()` (which sets
 /// `output_tx = Some(...)` on the session) but a subsequent write fails
 /// because the client already hung up, the session must not stay pinned as

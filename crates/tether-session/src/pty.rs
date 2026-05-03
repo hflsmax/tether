@@ -33,6 +33,16 @@ pub struct PtyHandle {
     pub child_pid: nix::unistd::Pid,
 }
 
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        let pid = self.child_pid;
+        // Send SIGHUP to the child's process group (mirrors terminal hangup)
+        let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGHUP);
+        // Also signal the child directly in case it changed process groups
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP);
+    }
+}
+
 /// Spawn a child process in a new PTY.
 pub fn spawn_pty(
     cmd: &str,
